@@ -1,2 +1,7 @@
 # ESP32-based-w-ATmega328p-coprocessor-based-Quadcopter-UAV
-&lt;details> &lt;summary>&lt;b>🚨 Legal Disclaimer &amp; Safety Warning (Click to expand)&lt;/b>&lt;/summary> [Insert the text above here] &lt;/details>
+
+⚠️ CAUTION AND LEGAL DISCLAIMER ⚠️
+
+Potential for Misuse: Due to the advanced tracking and autonomous capabilities of this platform, the underlying technology could theoretically be weaponized.
+Strict Prohibition: Do NOT attempt to weaponize or modify this project for offensive purposes without explicit legal authority, proper licensing, and strict regulatory compliance.
+Intended Use: This project is strictly intended for educational research and professional portfolio-building purposes only.
