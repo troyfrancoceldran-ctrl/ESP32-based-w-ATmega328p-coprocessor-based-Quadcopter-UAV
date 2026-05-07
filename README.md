@@ -1,4 +1,4 @@
-# ESP32-based-w-ATmega328p-coprocessor-based-Quadcopter-UAV
+# ESP32-based-w-ATmega328p-coprocessor-based-Quadcopter-UAV-with-OpenCV_capabilities
 
 ⚠️ CAUTION AND LEGAL DISCLAIMER ⚠️
 
