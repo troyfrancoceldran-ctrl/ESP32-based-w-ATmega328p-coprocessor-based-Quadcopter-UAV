@@ -1,2 +1,76 @@
-BEFORE RECREATING THIS, YOU MUST DOWNLOAD AND SETUP ALL NECESSARY SOFTWARES, COMPILERS NEEDED TO ACHIEVE THIS PROJECT. 
-FEEL FREE TO SEARCH THE INTERNET HOW TO SETUP HOMEBREW/GCC-COMPILER/KICAD FOR THIS PROJECT.
+# ESP32 & ATmega328p Coprocessor Quadcopter UAV
+
+Welcome to the main repository for the ESP32-based Quadcopter UAV, featuring an ATmega328p coprocessor. 
+
+In this architecture, the ESP32 handles high-level flight dynamics, complex computations, and wireless communication. The ATmega328p acts as a dedicated coprocessor handling low-level, real-time hardware tasks such as precise motor PWM generation and sensor interfacing. Both microcontrollers are programmed strictly in baremetal C/C++ to ensure maximum performance and minimal overhead.
+
+This guide covers how to set up the official development environments required to view the hardware designs, compile the firmware from scratch, and flash the boards.
+
+---
+
+## Table of Contents
+1. [Hardware Design Setup (KiCad)](#1-hardware-design-setup-kicad)
+2. [Baremetal Toolchain Setup](#2-baremetal-toolchain-setup)
+3. [Flashing the Microcontrollers](#3-flashing-the-microcontrollers)
+4. [License](#4-license)
+
+---
+
+## 1. Hardware Design Setup (KiCad)
+
+The custom flight controller board and schematics were designed using KiCad. 
+
+To view, edit, or generate manufacturing files for the hardware:
+1. Download and install the latest version of KiCad from the [official KiCad download page](https://www.kicad.org/download/).
+2. Clone this repository to your local machine.
+3. Open KiCad, click **File > Open Project**, and navigate to the `.kicad_pro` file inside the hardware directory.
+4. Use the **Schematic Editor** to view the circuit design and the **PCB Editor** to inspect the board layout and 3D model.
+
+---
+
+## 2. Baremetal Toolchain Setup
+
+### ESP32 Setup (ESP-IDF)
+To compile the high-level flight controller firmware for the ESP32, you need the official Espressif IoT Development Framework (ESP-IDF). 
+
+For the most up-to-date, OS-specific instructions, always refer to the [Official ESP-IDF Get Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/index.html).
+
+**General Linux/macOS Command Line Installation:**
+```bash
+# Create a directory for ESP-IDF
+mkdir -p ~/esp
+cd ~/esp
+
+# Clone the official repository
+git clone --recursive [https://github.com/espressif/esp-idf.git](https://github.com/espressif/esp-idf.git)
+
+# Run the official installation script
+cd esp-idf
+./install.sh esp32
+
+
+// ENVIRONMENT SETUP
+# On Linux/macOS
+. $HOME/esp/esp-idf/export.sh
+
+# On Windows (Command Prompt)
+%USERPROFILE%\esp\esp-idf\export.bat
+
+# Build the project
+idf.py build
+
+# Flash to the board and open the serial monitor (replace YOUR_PORT with your COM/tty port)
+idf.py -p (YOUR_PORT) flash monitor
+
+make -> make flash(same method for ATmega328p)
+
+## 3. ATmega328p Setup
+//For Windows/Linux
+sudo apt-get update
+sudo apt-get install gcc-avr binutils-avr avr-libc avrdude
+
+//For MacOS
+brew tap osx-cross/avr
+brew install avr-gcc
+brew install avrdude
+
