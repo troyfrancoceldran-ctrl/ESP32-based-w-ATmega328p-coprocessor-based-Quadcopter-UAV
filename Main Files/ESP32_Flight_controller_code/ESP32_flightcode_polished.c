@@ -35,10 +35,10 @@
  *─────────────────────────────────────────────────────────────────────────────*/
 
 /** Wi‑Fi credentials and telemetry target */
-#define WIFI_SSID  "3rdF"
-#define WIFI_PASS  "HabilisEE-3rd"
-#define PC_IP      "192.168.68.100"
-#define UDP_PORT   4444
+#define WIFI_SSID  "YOUR-WIFI-SSID"
+#define WIFI_PASS  "YOUR-WIFI-PASSWORD"
+#define PC_IP      "IP-ADDRESS"
+#define UDP_PORT   YOUR-UDP-PORT
 
 /** ESC signal pins (50 Hz servo‑style PWM) */
 #define ESC1_PIN 13 // CCW
