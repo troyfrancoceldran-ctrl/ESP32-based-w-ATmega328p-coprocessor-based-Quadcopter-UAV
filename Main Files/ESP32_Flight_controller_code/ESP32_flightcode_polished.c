@@ -34,10 +34,10 @@
  * CONFIGURATION
  *─────────────────────────────────────────────────────────────────────────────*/
 
-/** Wi‑Fi credentials and telemetry target */
+/** Wi‑Fi credentials and telemetry target(ARBITRARY) */
 #define WIFI_SSID  "YOUR-WIFI-SSID"
 #define WIFI_PASS  "YOUR-WIFI-PASSWORD"
-#define PC_IP      "IP-ADDRESS"
+#define PC_IP      "IP-ADDRESS" 
 #define UDP_PORT   YOUR-UDP-PORT
 
 /** ESC signal pins (50 Hz servo‑style PWM) */
