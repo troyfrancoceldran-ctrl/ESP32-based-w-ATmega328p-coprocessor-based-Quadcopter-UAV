@@ -34,11 +34,11 @@
  * CONFIGURATION
  *─────────────────────────────────────────────────────────────────────────────*/
 
-/** Wi‑Fi credentials and telemetry target(ARBITRARY) */
-#define WIFI_SSID  "YOUR-WIFI-SSID"
+/** Wi‑Fi credentials and telemetry target */
+#define WIFI_SSID  "YOUR-WIFI-NAME"
 #define WIFI_PASS  "YOUR-WIFI-PASSWORD"
-#define PC_IP      "IP-ADDRESS" 
-#define UDP_PORT   YOUR-UDP-PORT
+#define PC_IP      "YOUR-COMPUTER'S-IP-ADDRESS"
+#define UDP_PORT   YOU-UPD-PORT-VALUE
 
 /** ESC signal pins (50 Hz servo‑style PWM) */
 #define ESC1_PIN 13 // CCW
@@ -53,7 +53,7 @@
 #define I2C_HZ   400000
 
 /** FlySky receiver and coprocessor serial ports */
-#define IBUS_RX_PIN 16
+#define IBUS_RX_PIN 4 // <-- the latest update, moved RX from GPIO-16 to GPIO-4
 #define IBUS_UART_NUM UART_NUM_1
 #define COPRO_TX_PIN 17
 #define COPRO_UART_NUM UART_NUM_2
