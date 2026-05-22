@@ -1,0 +1,51 @@
+
+
+
+
+/*─────────────────────────────────────────────────────────────────────────────*
+ * MAIN
+ *─────────────────────────────────────────────────────────────────────────────*/
+void app_main(void){
+    nvs_flash_init();
+    ESP_LOGI(TAG, "Booting flight controller");
+    pwm_init();
+
+    // =================================────────────────====================
+    // TEMPORARY ESC CALIBRATION BLOCK (Comment out or delete after Phase 1)
+    // =====================================================================
+    ESP_LOGW(TAG, "=================================================");
+    ESP_LOGW(TAG, "           ESC CALIBRATION MODE ACTIVE           ");
+    ESP_LOGW(TAG, "   [!] ALERT: REMOVE ALL PROPELLERS FIRST [!]    ");
+    ESP_LOGW(TAG, "=================================================");
+    
+    // 1. Instantly scream MAX throttle (2000us) on all channels
+    for (int i = 0; i < 4; i++) {
+        set_throttle(i, 2000);
+    }
+    ESP_LOGW(TAG, ">> Broadcasting MAX Throttle (2000us)...");
+    ESP_LOGE(TAG, ">> NOW PLUG IN YOUR 12.6V XT60 BATTERY! (You have 7 seconds)");
+    
+    // Gives you 7 seconds to physically plug in your battery connector
+    vTaskDelay(pdMS_TO_TICKS(7000)); 
+    
+    // 2. Drop to MIN throttle (1000us) to finalize the calibration limits
+    ESP_LOGW(TAG, ">> Catching high-point chimes... Dropping to MIN Throttle (1000us)...");
+    for (int i = 0; i < 4; i++) {
+        set_throttle(i, 1000);
+    }
+    ESP_LOGW(TAG, ">> Waiting for ESC range-save confirmation tones...");
+    vTaskDelay(pdMS_TO_TILKS(4000));
+    
+    ESP_LOGW(TAG, ">> SUCCESS: Calibration complete! Unplug battery and Mac USB.");
+    ESP_LOGW(TAG, "=================================================");
+    // =====================================================================
+
+    wifi_init_sta();
+    copro_uart_init();
+    vTaskDelay(pdMS_TO_TICKS(3000));   // Allow ESC signal lines to settle
+    i2c_init();
+
+    xTaskCreatePinnedToCore(task_ibus,   "RX",     4096, NULL,  5, NULL, 1);
+    xTaskCreatePinnedToCore(task_flight, "Flight", 6144, NULL, 10, NULL, 1);
+    xTaskCreatePinnedToCore(task_udp,    "UDP",    4096, NULL,  2, NULL, 0);
+}
