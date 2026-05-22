@@ -48,9 +48,9 @@
  *─────────────────────────────────────────────────────────────────────────────*/
 
 /** Wi‑Fi credentials and telemetry target */
-#define WIFI_SSID  "WIFI_ROUTER_NAME"
-#define WIFI_PASS  "WIFI_PASSWORD"
-#define PC_IP      "YOUR_IP_ADDRESS"
+#define WIFI_SSID  "WIFI_NAME"
+#define WIFI_PASS  "WIFI_PSWRD"
+#define PC_IP      "IP-Address"
 #define UDP_PORT   4444 // <- the UDP-Port I used
 
 /**
@@ -513,7 +513,7 @@ static void task_flight(void *a){
         uint8_t s = (uint8_t)state;
         uart_write_bytes(COPRO_UART_NUM, (char*)&s, 1);
 
-        vTaskDelayUntil(&last, period);
+        vTaskDelay(period); // <--- CHANGE TO THIS
     }
 }
 
