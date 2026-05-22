@@ -82,12 +82,15 @@ static uint8_t HAL_UART_Read(uint8_t *b){
     return 0;
 }
 
-/** Initializes ADC in single‑ended mode using AVCC reference. */
+/** Initializes ADC in single-ended mode using AVCC reference. */
 static void HAL_ADC_Init(void){
+    // Disable digital input buffer on A0 to prevent shoot-through 
+    // current and logic toggling from intermediate analog voltages
+    DIDR0 |= (1<<ADC0D);
+
     ADMUX  = (1<<REFS0)|BATT_CH;
     ADCSRA = (1<<ADEN)|(1<<ADPS2)|(1<<ADPS1)|(1<<ADPS0);
 }
-
 /** Performs blocking ADC read (~100 µs). */
 static uint16_t HAL_ADC_Read(void){
     ADCSRA |= (1<<ADSC); while(ADCSRA & (1<<ADSC)); return ADC;
