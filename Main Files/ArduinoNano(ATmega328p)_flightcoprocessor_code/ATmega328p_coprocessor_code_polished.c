@@ -91,6 +91,7 @@ static void HAL_ADC_Init(void){
     ADMUX  = (1<<REFS0)|BATT_CH;
     ADCSRA = (1<<ADEN)|(1<<ADPS2)|(1<<ADPS1)|(1<<ADPS0);
 }
+
 /** Performs blocking ADC read (~100 µs). */
 static uint16_t HAL_ADC_Read(void){
     ADCSRA |= (1<<ADSC); while(ADCSRA & (1<<ADSC)); return ADC;
@@ -124,29 +125,35 @@ static void Task_Update(Context *c){
  *  - FAILSAFE (4)  : rapid beep (100 ms period)
  *  - All others    : silent
  */
+/**
+ * @brief Drives passive buzzer by generating a 2 kHz frequency when triggered.
+ */
 static void Task_Output(Context *c){
-    uint32_t now = get_ms();   // Single atomic read for this output cycle
+    uint32_t now = get_ms();
+    uint8_t toggle_buzz = 0;
 
-    if(c->low){
-        /* Critical battery → fast beep */
-        if((now % 400) < 200) PORTD |=  (1<<BUZZ_PIN);
-        else                  PORTD &= ~(1<<BUZZ_PIN);
-        return;
+    // Check if we are in a warning window (Low Battery or Failsafe)
+    if (c->low) {
+        /* Critical battery → fast beep (200ms ON, 200ms OFF) */
+        if ((now % 400) < 200) toggle_buzz = 1;
+    } 
+    else if (c->state == 4) {
+        /* FAILSAFE → rapid beep (50ms ON, 50ms OFF) */
+        if ((now % 100) < 50) toggle_buzz = 1;
     }
 
-    switch(c->state){
-    case 4:
-        /* FAILSAFE → rapid beep */
-        if((now % 100) < 50) PORTD |=  (1<<BUZZ_PIN);
-        else                 PORTD &= ~(1<<BUZZ_PIN);
-        break;
-    default:
-        /* All other states → buzzer off */
-        PORTD &= ~(1<<BUZZ_PIN);
-        break;
+    // Generate the sound
+    if (toggle_buzz) {
+        /* Rapidly toggle the pin to generate a ~2 kHz tone */
+        PORTD |=  (1 << BUZZ_PIN);
+        _delay_us(250);
+        PORTD &= ~(1 << BUZZ_PIN);
+        _delay_us(250);
+    } else {
+        /* Ensure pin is off when silent */
+        PORTD &= ~(1 << BUZZ_PIN);
     }
 }
-
 /*────────────────────────── Main Program ───────────────────────────────────*/
 int main(void){
     HAL_GPIO_Init();
