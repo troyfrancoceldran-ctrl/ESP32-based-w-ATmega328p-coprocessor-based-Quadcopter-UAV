@@ -48,9 +48,9 @@
  *─────────────────────────────────────────────────────────────────────────────*/
 
 /** Wi‑Fi credentials and telemetry target */
-#define WIFI_SSID  "WIFI_NAME"
-#define WIFI_PASS  "WIFI_PSWRD"
-#define PC_IP      "IP-Address"
+#define WIFI_SSID  "3rdF"
+#define WIFI_PASS  "HabilisEE-3rd"
+#define PC_IP      "192.168.68.108"
 #define UDP_PORT   4444 // <- the UDP-Port I used
 
 /**
@@ -124,7 +124,7 @@ typedef enum {
  *─────────────────────────────────────────────────────────────────────────────*/
 RC_Input_t    rc    = {1500,1500,1000,1500,0};
 IMU_Data_t    imu   = {0};
-PID_t pid_r = {0.5,0.0,0.02,0,0}, pid_p = {0.5,0.0,0.02,0,0}, pid_y = {1.0,0.0,0.03,0,0};
+PID_t pid_r = {1.5,0.0,0.02,0,0}, pid_p = {1.5,0.0,0.02,0,0}, pid_y = {2.0,0.0,0.03,0,0};
 FlightState_t state = STATE_BOOTING;
 
 /**
@@ -477,10 +477,10 @@ static void task_flight(void *a){
                 float py = pid_compute(&pid_y, ey);
 
                 if (rc.throttle > 1050){
-                    set_throttle(0, rc.throttle - pp + pr + py);
-                    set_throttle(1, rc.throttle - pp - pr - py);
-                    set_throttle(2, rc.throttle + pp - pr + py);
-                    set_throttle(3, rc.throttle + pp + pr - py);
+                    set_throttle(0, rc.throttle - pp - pr + py);
+                    set_throttle(1, rc.throttle - pp + pr - py);
+                    set_throttle(2, rc.throttle + pp + pr + py);
+                    set_throttle(3, rc.throttle + pp - pr - py);
                 } else {
                     for (int i = 0; i < 4; i++) set_throttle(i, 1000);
                     pid_reset_all();
