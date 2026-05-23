@@ -72,7 +72,7 @@
 /** FlySky receiver and coprocessor serial ports */
 #define IBUS_RX_PIN 4
 #define IBUS_UART_NUM UART_NUM_1
-#define COPRO_TX_PIN 17
+#define COPRO_TX_PIN 14 // <--- Changed from GPIO-17 to GPIO-14
 #define COPRO_UART_NUM UART_NUM_2
 
 /** Timing constants */
