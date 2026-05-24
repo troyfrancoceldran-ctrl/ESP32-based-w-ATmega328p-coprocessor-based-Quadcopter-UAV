@@ -48,9 +48,9 @@
  *─────────────────────────────────────────────────────────────────────────────*/
 
 /** Wi‑Fi credentials and telemetry target */
-#define WIFI_SSID  "3rdF"
-#define WIFI_PASS  "HabilisEE-3rd"
-#define PC_IP      "192.168.68.108"
+#define WIFI_SSID  "YOUR_WIFI_NAME"
+#define WIFI_PASS  "YOUR_WIFI_PASSWORD"
+#define PC_IP      "YOU_IP_ADDRESS"
 #define UDP_PORT   4444 // <- the UDP-Port I used
 
 /**
