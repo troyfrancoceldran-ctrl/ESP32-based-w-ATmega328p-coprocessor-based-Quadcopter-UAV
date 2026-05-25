@@ -14,6 +14,9 @@
  * Fixes applied:
  *  - [BUG FIX] ESC2 remapped from GPIO12 (strapping pin / MTDI) to GPIO25
  *    to prevent boot-mode selection conflicts on power-up.
+ *  - [BUG FIX] ESC3 remapped from GPIO14 (strapping pin / MTMS) to GPIO26.
+ *  - [BUG FIX] COPRO_TX_PIN remapped from GPIO14 (strapping pin) to GPIO16.
+ *    GPIO17 was physically damaged; GPIO16 is a safe, output-capable replacement.
  *  - [BUG FIX] Shared globals (imu, state, rc) protected with portMUX_TYPE
  *    spinlock to prevent cross-core race conditions between task_flight
  *    (Core 1) and task_udp (Core 0).
@@ -21,6 +24,9 @@
  *    EventGroup before opening the UDP socket, preventing silent sendto()
  *    failures on slow or congested Wi-Fi networks. Socket creation is also
  *    guarded against failure.
+ *  - [BUG FIX] Flight loop restored to vTaskDelayUntil() to guarantee a hard
+ *    250 Hz period. vTaskDelay() caused a variable dt longer than LOOP_TIME_S,
+ *    making the derivative term inaccurate and destabilizing flight.
  *
  * @authors
  * Troy Franco G. Celdran (et al.)
@@ -50,17 +56,17 @@
 /** Wi‑Fi credentials and telemetry target */
 #define WIFI_SSID  "YOUR_WIFI_NAME"
 #define WIFI_PASS  "YOUR_WIFI_PASSWORD"
-#define PC_IP      "YOU_IP_ADDRESS"
-#define UDP_PORT   4444 // <- the UDP-Port I used
+#define PC_IP      "YOUR_IP_ADDRESS"
+#define UDP_PORT   4444
 
 /**
  * ESC signal pins (50 Hz servo‑style PWM).
- * GPIO12 (MTDI strapping pin) was replaced with GPIO25 for ESC2.
- * GPIO25 is a safe output-capable pin with no boot-mode side effects.
+ * GPIO12 (MTDI) → GPIO25 for ESC2: avoids boot-mode strapping conflict.
+ * GPIO14 (MTMS) → GPIO26 for ESC3: avoids JTAG strapping conflict.
  */
 #define ESC1_PIN 13  ///< CCW (Front-Right)
 #define ESC2_PIN 25  ///< CW  (Front-Left)  — was GPIO12 (strapping pin, FIXED)
-#define ESC3_PIN 26  ///< CCW (Back-Left)
+#define ESC3_PIN 26  ///< CCW (Back-Left)   — was GPIO14 (strapping pin, FIXED)
 #define ESC4_PIN 27  ///< CW  (Back-Right)
 
 /** I²C connections to IMU (GY‑521 / MPU6050) */
@@ -69,16 +75,22 @@
 #define I2C_PORT I2C_NUM_0
 #define I2C_HZ   400000
 
-/** FlySky receiver and coprocessor serial ports */
-#define IBUS_RX_PIN 4
+/** FlySky receiver serial port */
+#define IBUS_RX_PIN   4
 #define IBUS_UART_NUM UART_NUM_1
-#define COPRO_TX_PIN 14 // <--- Changed from GPIO-17 to GPIO-14
+
+/**
+ * Coprocessor serial port.
+ * GPIO17 was physically damaged on the previous board.
+ * GPIO16 is a safe, output-capable replacement with no strapping side effects.
+ */
+#define COPRO_TX_PIN   16   ///< was GPIO17 (damaged), was GPIO14 (strapping pin)
 #define COPRO_UART_NUM UART_NUM_2
 
 /** Timing constants */
 #define LOOP_TIME_S 0.004f         ///< Loop period (4 ms = 250 Hz)
-#define RAD_TO_DEG 57.2958f
-#define I_MAX 50.0f                ///< Integral‑term saturation limit
+#define RAD_TO_DEG  57.2958f
+#define I_MAX       50.0f          ///< Integral‑term saturation limit
 
 /** EventGroup bit signalling that Wi-Fi has an IP address */
 #define WIFI_GOT_IP_BIT BIT0
@@ -122,9 +134,11 @@ typedef enum {
 /*─────────────────────────────────────────────────────────────────────────────*
  * GLOBALS
  *─────────────────────────────────────────────────────────────────────────────*/
-RC_Input_t    rc    = {1500,1500,1000,1500,0};
+RC_Input_t    rc    = {1500, 1500, 1000, 1500, 0};
 IMU_Data_t    imu   = {0};
-PID_t pid_r = {1.5,0.0,0.02,0,0}, pid_p = {1.5,0.0,0.02,0,0}, pid_y = {2.0,0.0,0.03,0,0};
+PID_t pid_r = {1.5, 0.0, 0.02, 0, 0};
+PID_t pid_p = {1.5, 0.0, 0.02, 0, 0};
+PID_t pid_y = {2.0, 0.0, 0.03, 0, 0};
 FlightState_t state = STATE_BOOTING;
 
 /**
@@ -247,7 +261,7 @@ static void wifi_init_sta(void){
 
     /* Register handler BEFORE starting Wi-Fi so no event is missed */
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                            wifi_event_handler, NULL);
+                               wifi_event_handler, NULL);
 
     wifi_config_t w = {0};
     strcpy((char*)w.sta.ssid,     WIFI_SSID);
@@ -261,10 +275,10 @@ static void wifi_init_sta(void){
 /** Initializes dedicated UART2 link to ATmega coprocessor. */
 static void copro_uart_init(void){
     uart_config_t c = {9600, UART_DATA_8_BITS, UART_PARITY_DISABLE,
-                    UART_STOP_BITS_1, UART_HW_FLOWCTRL_DISABLE, 0};
+                       UART_STOP_BITS_1, UART_HW_FLOWCTRL_DISABLE, 0};
     uart_param_config(COPRO_UART_NUM, &c);
     uart_set_pin(COPRO_UART_NUM, COPRO_TX_PIN,
-                UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     uart_driver_install(COPRO_UART_NUM, 256, 0, 0, NULL, 0);
 }
 
@@ -313,9 +327,9 @@ static void task_udp(void *a){
 
         snprintf(buf, sizeof buf, "%lu,%d,%.2f,%.2f,%d\n",
                  (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS),
-                state_snap, roll_snap, pitch_snap, throttle_snap);
+                 state_snap, roll_snap, pitch_snap, throttle_snap);
         sendto(sock, buf, strlen(buf), 0,
-            (struct sockaddr*)&dest, sizeof dest);
+               (struct sockaddr*)&dest, sizeof dest);
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
@@ -325,10 +339,10 @@ static void task_udp(void *a){
  */
 static void task_ibus(void *a){
     uart_config_t c = {115200, UART_DATA_8_BITS, UART_PARITY_DISABLE,
-                    UART_STOP_BITS_1, UART_HW_FLOWCTRL_DISABLE, 0};
+                       UART_STOP_BITS_1, UART_HW_FLOWCTRL_DISABLE, 0};
     uart_param_config(IBUS_UART_NUM, &c);
     uart_set_pin(IBUS_UART_NUM, UART_PIN_NO_CHANGE, IBUS_RX_PIN,
-                UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     uart_driver_install(IBUS_UART_NUM, 1024, 0, 0, NULL, 0);
 
     uint8_t pkt[32];
@@ -339,10 +353,10 @@ static void task_ibus(void *a){
             for (int i = 0; i < 30; i++) chk -= pkt[i];
             if (chk == (pkt[30] | (pkt[31] << 8))){
                 taskENTER_CRITICAL(&telemetry_mux);
-                rc.roll             = pkt[2] | (pkt[3] << 8);
-                rc.pitch            = pkt[4] | (pkt[5] << 8);
-                rc.throttle         = pkt[6] | (pkt[7] << 8);
-                rc.yaw              = pkt[8] | (pkt[9] << 8);
+                rc.roll              = pkt[2] | (pkt[3] << 8);
+                rc.pitch             = pkt[4] | (pkt[5] << 8);
+                rc.throttle          = pkt[6] | (pkt[7] << 8);
+                rc.yaw               = pkt[8] | (pkt[9] << 8);
                 rc.last_packet_ticks = xTaskGetTickCount();
                 taskEXIT_CRITICAL(&telemetry_mux);
             }
@@ -361,16 +375,21 @@ static void task_ibus(void *a){
  * - Motor mixing
  * - Safety constraints
  *
+ * vTaskDelayUntil() is used (not vTaskDelay) to guarantee a hard 250 Hz
+ * period regardless of loop body execution time. This keeps the dt assumption
+ * in the derivative term accurate and prevents timing jitter from destabilizing
+ * the PID controller.
+ *
  * Shared globals written here are protected by telemetry_mux so task_udp
  * on Core 0 always reads a consistent snapshot.
  */
 static void task_flight(void *a){
     uint8_t raw[14];
-    TickType_t last        = xTaskGetTickCount();
+    TickType_t last         = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(4);
 
-    float sx=0,sy=0,sgx=0,sgy=0,sgz=0;
-    uint16_t sample=0;
+    float sx=0, sy=0, sgx=0, sgy=0, sgz=0;
+    uint16_t sample = 0;
 
     for(;;){
         /* FAILSAFE MONITOR --------------------------------------------------*/
@@ -384,7 +403,7 @@ static void task_flight(void *a){
 
         /* IMU SENSOR BURST --------------------------------------------------*/
         i2c_master_write_read_device(I2C_PORT, 0x68,
-                                    (uint8_t[]){0x3B}, 1, raw, 14, 100);
+                                     (uint8_t[]){0x3B}, 1, raw, 14, 100);
         int16_t ax = (raw[0]<<8)|raw[1],  ay = (raw[2]<<8)|raw[3],
                 az = (raw[4]<<8)|raw[5];
         int16_t gx = (raw[8]<<8)|raw[9],  gy = (raw[10]<<8)|raw[11],
@@ -395,7 +414,7 @@ static void task_flight(void *a){
         case STATE_BOOTING:
             for (int i = 0; i < 4; i++) set_throttle(i, 1000);
             if (xTaskGetTickCount() > pdMS_TO_TICKS(3000)){
-                ESP_LOGI(TAG, "Beginning calibration…");
+                ESP_LOGI(TAG, "Beginning calibration...");
                 taskENTER_CRITICAL(&telemetry_mux);
                 state = STATE_CALIBRATING;
                 taskEXIT_CRITICAL(&telemetry_mux);
@@ -411,23 +430,25 @@ static void task_flight(void *a){
             sgz += gz / 65.5f;
             if (++sample >= 500){
                 taskENTER_CRITICAL(&telemetry_mux);
-                imu.roll_offset        = sx  / 500;
-                imu.pitch_offset       = sy  / 500;
-                imu.gyro_roll_offset   = sgx / 500;
-                imu.gyro_pitch_offset  = sgy / 500;
-                imu.gyro_yaw_offset    = sgz / 500;
-                imu.roll_angle  = atan2f(ay,az)*RAD_TO_DEG - imu.roll_offset;
-                imu.pitch_angle = atan2f(-ax,hypotf(ay,az))*RAD_TO_DEG - imu.pitch_offset;
+                imu.roll_offset       = sx  / 500;
+                imu.pitch_offset      = sy  / 500;
+                imu.gyro_roll_offset  = sgx / 500;
+                imu.gyro_pitch_offset = sgy / 500;
+                imu.gyro_yaw_offset   = sgz / 500;
+                imu.roll_angle  = atan2f(ay, az) * RAD_TO_DEG
+                                  - imu.roll_offset;
+                imu.pitch_angle = atan2f(-ax, hypotf(ay, az)) * RAD_TO_DEG
+                                  - imu.pitch_offset;
                 state = STATE_DISARMED;
                 taskEXIT_CRITICAL(&telemetry_mux);
-                ESP_LOGI(TAG, "Calibration complete → DISARMED");
+                ESP_LOGI(TAG, "Calibration complete -> DISARMED");
             }
             break;
 
         /*──────────────────────── DISARM / ARM ───────────────────*/
         case STATE_DISARMED:
         case STATE_ARMED:{
-            /* Sensor fusion — read offsets under lock for consistency */
+            /* Read offsets under lock for consistency */
             taskENTER_CRITICAL(&telemetry_mux);
             float gr_off = imu.gyro_roll_offset;
             float gp_off = imu.gyro_pitch_offset;
@@ -504,7 +525,7 @@ static void task_flight(void *a){
                 taskENTER_CRITICAL(&telemetry_mux);
                 state = STATE_DISARMED;
                 taskEXIT_CRITICAL(&telemetry_mux);
-                ESP_LOGI(TAG, "Signal recovered → DISARMED");
+                ESP_LOGI(TAG, "Signal recovered -> DISARMED");
             }
             break;
         }
@@ -513,7 +534,9 @@ static void task_flight(void *a){
         uint8_t s = (uint8_t)state;
         uart_write_bytes(COPRO_UART_NUM, (char*)&s, 1);
 
-        vTaskDelay(period); // <--- CHANGE TO THIS
+        /* Hard real-time 250 Hz deadline — accounts for loop execution time.
+         * vTaskDelayUntil guarantees dt == LOOP_TIME_S for the D-term. */
+        vTaskDelayUntil(&last, period);
     }
 }
 
