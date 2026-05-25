@@ -328,6 +328,7 @@ static void task_flight(void *a){
             int16_t ax = (raw[0]<<8)|raw[1],  ay = (raw[2]<<8)|raw[3],  az = (raw[4]<<8)|raw[5];
             int16_t gx = (raw[8]<<8)|raw[9],  gy = (raw[10]<<8)|raw[11], gz = (raw[12]<<8)|raw[13];
 
+            // Finite State Machine (FSM) Implementation 
             switch(state){
             case STATE_BOOTING:
                 for (int i = 0; i < 4; i++) set_throttle(i, 1000);
