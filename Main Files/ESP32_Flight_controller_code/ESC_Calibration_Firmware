@@ -1,0 +1,370 @@
+/**
+ * @file esc_calibration.c
+ * @brief Standalone ESP32 ESC Calibration Firmware.
+ *
+ * PURPOSE:
+ *   Flash this to the ESP32 INSTEAD of the flight controller firmware.
+ *   It drives all four ESC channels through a calibration sequence so
+ *   every ESC learns the exact 1000–2000 µs PWM range used by the
+ *   flight controller.
+ *
+ * PROCEDURE:
+ *   1. Flash this firmware.
+ *   2. Open serial monitor at 115200 baud.
+ *   3. DO NOT connect LiPo yet.
+ *   4. Power the ESP32 from USB only.
+ *   5. The firmware outputs 2000 µs (MAX) and waits.
+ *   6. When the serial prompt appears, connect the LiPo.
+ *   7. Wait for ESCs to beep twice (calibration mode entered).
+ *   8. Firmware automatically drops to 1000 µs (MIN) after 4 seconds.
+ *   9. Wait for the long confirmation beep from each ESC.
+ *   10. Firmware runs a verification sweep and reports results.
+ *   11. Flash your flight controller firmware and reboot.
+ *
+ * PIN ASSIGNMENTS (must match flight controller firmware):
+ *   ESC1 (Front-Right, CCW) → GPIO13
+ *   ESC2 (Front-Left,  CW)  → GPIO25
+ *   ESC3 (Back-Left,   CCW) → GPIO26
+ *   ESC4 (Back-Right,  CW)  → GPIO27
+ *
+ * SAFETY:
+ *   REMOVE ALL PROPELLERS BEFORE RUNNING THIS FIRMWARE.
+ *   Motors WILL spin during the verification sweep.
+ *
+ * @author Troy Franco G. Celdran (et al.)
+ * @date   2026-04-29
+ */
+
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/ledc.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+
+/*─────────────────────────────────────────────────────────────────────────────*
+ * CONFIGURATION — must match flight controller firmware
+ *─────────────────────────────────────────────────────────────────────────────*/
+
+#define ESC1_PIN 13   ///< CCW Front-Right
+#define ESC2_PIN 25   ///< CW  Front-Left
+#define ESC3_PIN 26   ///< CCW Back-Left
+#define ESC4_PIN 27   ///< CW  Back-Right
+
+#define NUM_ESCS     4
+#define PWM_FREQ_HZ  50
+#define PWM_MIN_US   1000   ///< Minimum throttle (armed idle)
+#define PWM_MAX_US   2000   ///< Maximum throttle
+#define PWM_IDLE_US  1050   ///< Just above idle — used in sweep
+#define PWM_SWEEP_US 1200   ///< Mid-low sweep point for verification
+
+/** How long to hold MAX signal while waiting for LiPo (ms) */
+#define WAIT_FOR_LIPO_MS  8000
+/** How long ESCs need to register the high point before dropping (ms) */
+#define HIGH_HOLD_MS      4000
+/** How long to hold MIN after dropping (ms) */
+#define LOW_HOLD_MS       3000
+/** Sweep step duration (ms) */
+#define SWEEP_STEP_MS     20
+
+static const char *TAG = "ESC_CALIB";
+
+/*─────────────────────────────────────────────────────────────────────────────*
+ * PWM DRIVER
+ *─────────────────────────────────────────────────────────────────────────────*/
+
+/**
+ * @brief Initialises four LEDC channels at 50 Hz, initially outputting
+ *        PWM_MIN_US to keep ESCs silent before calibration begins.
+ */
+static void pwm_init(void)
+{
+    ledc_timer_config_t timer = {
+        .speed_mode      = LEDC_LOW_SPEED_MODE,
+        .timer_num       = LEDC_TIMER_0,
+        .duty_resolution = LEDC_TIMER_13_BIT,
+        .freq_hz         = PWM_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&timer);
+
+    const int pins[NUM_ESCS] = {ESC1_PIN, ESC2_PIN, ESC3_PIN, ESC4_PIN};
+    for (int i = 0; i < NUM_ESCS; i++) {
+        ledc_channel_config_t ch = {
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .channel    = (ledc_channel_t)i,
+            .timer_sel  = LEDC_TIMER_0,
+            .intr_type  = LEDC_INTR_DISABLE,
+            .gpio_num   = pins[i],
+            .duty       = (PWM_MIN_US * 8192) / 20000,   // 1000 µs default
+            .hpoint     = 0
+        };
+        ledc_channel_config(&ch);
+    }
+}
+
+/**
+ * @brief Sets all four ESC channels to the same pulse width.
+ * @param us  Pulse width in microseconds (clamped 1000–2000).
+ */
+static void set_all(int us)
+{
+    if (us < PWM_MIN_US) us = PWM_MIN_US;
+    if (us > PWM_MAX_US) us = PWM_MAX_US;
+    uint32_t duty = ((uint32_t)us * 8192) / 20000;
+    for (int i = 0; i < NUM_ESCS; i++) {
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)i, duty);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)i);
+    }
+}
+
+/**
+ * @brief Sets a single ESC channel to a given pulse width.
+ * @param ch  LEDC channel index (0–3).
+ * @param us  Pulse width in microseconds (clamped 1000–2000).
+ */
+static void set_one(int ch, int us)
+{
+    if (us < PWM_MIN_US) us = PWM_MIN_US;
+    if (us > PWM_MAX_US) us = PWM_MAX_US;
+    uint32_t duty = ((uint32_t)us * 8192) / 20000;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)ch, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)ch);
+}
+
+/*─────────────────────────────────────────────────────────────────────────────*
+ * CALIBRATION SEQUENCE
+ *─────────────────────────────────────────────────────────────────────────────*/
+
+/**
+ * @brief Runs the full ESC calibration sequence.
+ *
+ * Timeline:
+ *  T+0s   : Output MAX (2000 µs) on all channels
+ *  T+0s   : Print "connect LiPo now"
+ *  T+8s   : (LiPo should be connected by now)
+ *  T+4s   : Drop to MIN (1000 µs)
+ *  T+3s   : Calibration saved in all ESCs
+ *  T+0s   : Run verification sweep
+ */
+static void calibration_sequence(void)
+{
+    /* ── STEP 1: Output MAX ──────────────────────────────────────────────── */
+    ESP_LOGI(TAG, "============================================");
+    ESP_LOGI(TAG, "  ESC CALIBRATION SEQUENCE");
+    ESP_LOGI(TAG, "============================================");
+    ESP_LOGI(TAG, "SAFETY CHECK: Are all propellers removed?");
+    ESP_LOGI(TAG, "Waiting 5 seconds — disconnect power NOW if props are on.");
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    ESP_LOGI(TAG, "Outputting MAX throttle (2000 us) on all channels...");
+    set_all(PWM_MAX_US);
+
+    ESP_LOGI(TAG, ">>> CONNECT YOUR LIPO NOW <<<");
+    ESP_LOGI(TAG, "You have %d seconds.", WAIT_FOR_LIPO_MS / 1000);
+
+    /* Count down so the user can see progress on the serial monitor */
+    for (int i = WAIT_FOR_LIPO_MS / 1000; i > 0; i--) {
+        ESP_LOGI(TAG, "  ...%d", i);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    /* ── STEP 2: Hold HIGH for ESCs to register ──────────────────────────── */
+    ESP_LOGI(TAG, "LiPo should be connected. Holding MAX for %d ms...", HIGH_HOLD_MS);
+    ESP_LOGI(TAG, "Listen for 2 short beeps from each ESC.");
+    vTaskDelay(pdMS_TO_TICKS(HIGH_HOLD_MS));
+
+    /* ── STEP 3: Drop to MIN ─────────────────────────────────────────────── */
+    ESP_LOGI(TAG, "Dropping to MIN throttle (1000 us)...");
+    set_all(PWM_MIN_US);
+
+    ESP_LOGI(TAG, "Listen for a long confirmation beep from each ESC.");
+    ESP_LOGI(TAG, "Holding MIN for %d ms...", LOW_HOLD_MS);
+    vTaskDelay(pdMS_TO_TICKS(LOW_HOLD_MS));
+
+    ESP_LOGI(TAG, "Calibration command sequence complete.");
+    ESP_LOGI(TAG, "If all ESCs beeped correctly, calibration is saved.");
+}
+
+/*─────────────────────────────────────────────────────────────────────────────*
+ * VERIFICATION SWEEP
+ *─────────────────────────────────────────────────────────────────────────────*/
+
+/**
+ * @brief Sweeps each ESC individually from idle to a low speed and back,
+ *        allowing the operator to verify each motor spins independently
+ *        and at similar speed.
+ *
+ * Each ESC is tested one at a time so the operator can watch each motor.
+ * All others are held at MIN during the individual test.
+ */
+static void verification_sweep(void)
+{
+    const char *esc_names[NUM_ESCS] = {
+        "ESC1 Front-Right (CCW) GPIO13",
+        "ESC2 Front-Left  (CW)  GPIO25",
+        "ESC3 Back-Left   (CCW) GPIO26",
+        "ESC4 Back-Right  (CW)  GPIO27"
+    };
+
+    ESP_LOGI(TAG, "============================================");
+    ESP_LOGI(TAG, "  VERIFICATION SWEEP");
+    ESP_LOGI(TAG, "  Each motor will spin briefly one at a time.");
+    ESP_LOGI(TAG, "  Watch that each spins smoothly and stops cleanly.");
+    ESP_LOGI(TAG, "============================================");
+
+    /* Safety pause before sweep */
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    for (int esc = 0; esc < NUM_ESCS; esc++) {
+        /* Hold all others at MIN */
+        set_all(PWM_MIN_US);
+        vTaskDelay(pdMS_TO_TICKS(500));
+
+        ESP_LOGI(TAG, "Testing: %s", esc_names[esc]);
+        ESP_LOGI(TAG, "  Ramping up to %d us...", PWM_SWEEP_US);
+
+        /* Ramp up */
+        for (int us = PWM_MIN_US; us <= PWM_SWEEP_US; us += 5) {
+            set_one(esc, us);
+            vTaskDelay(pdMS_TO_TICKS(SWEEP_STEP_MS));
+        }
+
+        /* Hold at sweep point */
+        ESP_LOGI(TAG, "  Holding at %d us for 1.5 seconds...", PWM_SWEEP_US);
+        vTaskDelay(pdMS_TO_TICKS(1500));
+
+        /* Ramp down */
+        ESP_LOGI(TAG, "  Ramping down to MIN...");
+        for (int us = PWM_SWEEP_US; us >= PWM_MIN_US; us -= 5) {
+            set_one(esc, us);
+            vTaskDelay(pdMS_TO_TICKS(SWEEP_STEP_MS));
+        }
+        set_one(esc, PWM_MIN_US);
+
+        ESP_LOGI(TAG, "  %s — DONE. Did the motor spin? (observe physically)",
+                 esc_names[esc]);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    /* All-motor simultaneous low-speed spin to check uniformity */
+    ESP_LOGI(TAG, "============================================");
+    ESP_LOGI(TAG, "  ALL-MOTOR UNIFORMITY CHECK");
+    ESP_LOGI(TAG, "  All four motors will spin simultaneously.");
+    ESP_LOGI(TAG, "  Listen: they should all sound the same speed.");
+    ESP_LOGI(TAG, "============================================");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    ESP_LOGI(TAG, "Ramping all to %d us...", PWM_IDLE_US);
+    for (int us = PWM_MIN_US; us <= PWM_IDLE_US; us += 5) {
+        set_all(us);
+        vTaskDelay(pdMS_TO_TICKS(SWEEP_STEP_MS));
+    }
+
+    ESP_LOGI(TAG, "Holding for 3 seconds — listen for uniform motor tone.");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    ESP_LOGI(TAG, "Ramping down...");
+    for (int us = PWM_IDLE_US; us >= PWM_MIN_US; us -= 5) {
+        set_all(us);
+        vTaskDelay(pdMS_TO_TICKS(SWEEP_STEP_MS));
+    }
+    set_all(PWM_MIN_US);
+
+    ESP_LOGI(TAG, "Uniformity check complete.");
+}
+
+/*─────────────────────────────────────────────────────────────────────────────*
+ * DIRECTION CHECK
+ *─────────────────────────────────────────────────────────────────────────────*/
+
+/**
+ * @brief Spins each motor at low speed long enough to visually confirm
+ *        rotation direction before any props are fitted.
+ *
+ * Required directions:
+ *   M1 (ESC1, G13): CCW   M2 (ESC2, G25): CW
+ *   M3 (ESC3, G26): CCW   M4 (ESC4, G27): CW
+ */
+static void direction_check(void)
+{
+    const char *direction_names[NUM_ESCS] = {
+        "M1 Front-Right → should spin CCW (counter-clockwise from above)",
+        "M2 Front-Left  → should spin CW  (clockwise from above)",
+        "M3 Back-Left   → should spin CCW (counter-clockwise from above)",
+        "M4 Back-Right  → should spin CW  (clockwise from above)"
+    };
+
+    ESP_LOGI(TAG, "============================================");
+    ESP_LOGI(TAG, "  MOTOR DIRECTION CHECK");
+    ESP_LOGI(TAG, "  Look at each motor from directly above.");
+    ESP_LOGI(TAG, "  If direction is wrong: swap any 2 phase wires at ESC.");
+    ESP_LOGI(TAG, "============================================");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    for (int esc = 0; esc < NUM_ESCS; esc++) {
+        set_all(PWM_MIN_US);
+        vTaskDelay(pdMS_TO_TICKS(500));
+
+        ESP_LOGI(TAG, "Spinning: %s", direction_names[esc]);
+        ESP_LOGI(TAG, "Watch the shaft from above for 3 seconds...");
+
+        /* Ramp up to a visible but slow speed */
+        for (int us = PWM_MIN_US; us <= 1150; us += 5) {
+            set_one(esc, us);
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        vTaskDelay(pdMS_TO_TICKS(3000));   /* Hold for visual check */
+
+        /* Ramp down */
+        for (int us = 1150; us >= PWM_MIN_US; us -= 5) {
+            set_one(esc, us);
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        set_one(esc, PWM_MIN_US);
+
+        ESP_LOGI(TAG, "  Was direction correct? If not, swap 2 phase wires.");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
+/*─────────────────────────────────────────────────────────────────────────────*
+ * MAIN
+ *─────────────────────────────────────────────────────────────────────────────*/
+
+void app_main(void)
+{
+    nvs_flash_init();
+    pwm_init();
+
+    ESP_LOGI(TAG, "ESC Calibration Firmware loaded.");
+    ESP_LOGI(TAG, "REMOVE ALL PROPELLERS BEFORE CONTINUING.");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    /* Phase 1: Calibrate the throttle range into each ESC */
+    calibration_sequence();
+
+    /* Phase 2: Verify each ESC responds and motors spin */
+    verification_sweep();
+
+    /* Phase 3: Confirm each motor spins the correct direction */
+    direction_check();
+
+    /* Done — hold all at MIN indefinitely */
+    set_all(PWM_MIN_US);
+
+    ESP_LOGI(TAG, "============================================");
+    ESP_LOGI(TAG, "  CALIBRATION COMPLETE");
+    ESP_LOGI(TAG, "  1. If any motor direction was wrong: swap 2 phase");
+    ESP_LOGI(TAG, "     wires on that ESC and re-run direction_check.");
+    ESP_LOGI(TAG, "  2. If any ESC didn't beep correctly during calib:");
+    ESP_LOGI(TAG, "     calibrate that ESC individually with a servo tester.");
+    ESP_LOGI(TAG, "  3. Flash your flight controller firmware and reboot.");
+    ESP_LOGI(TAG, "============================================");
+
+    /* Loop forever at MIN — safe idle state */
+    for (;;) {
+        set_all(PWM_MIN_US);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
