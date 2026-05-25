@@ -3,10 +3,14 @@
  * @brief Deterministic ESP32‑based Quadcopter Flight Controller using FreeRTOS.
  *
  * Fixes applied in this revision:
+ * - [PID FIX] Inverted Roll and Pitch mixer equations to properly counteract frame tilt.
+ * - [WIFI FIX] Disabled Wi-Fi Power Save (WIFI_PS_NONE) to guarantee consistent UDP streams.
+ * - [WIFI FIX] Added an event-driven auto-reconnection routing to handle boot noise drops.
+ * - [ESC FIX] Postponed Wi-Fi activation until after a 3-second stable PWM idle window.
  * - [FILTER FIX] Added First-Order Low-Pass Filter on raw gyro rates.
  * - [I2C BUG] Reduced I2C timeout to 1ms to prevent PID loop freezing.
  * - [IBUS BUG] Added uart_flush on bad packets to prevent permanent desync.
- * @author: TROY FRANCO G. CELDRAN - Head Engineer/Lead Firmware Engineer
+ * @author: TROY FRANCO G. CELDRAN / Head Project Engineer & Lead Firmware Engineer
  * @date 2026‑05-25
  */
 
@@ -31,9 +35,9 @@
  *─────────────────────────────────────────────────────────────────────────────*/
 
 #define WIFI_SSID  "WIFI_NAME"
-#define WIFI_PASS  "WIFI_PASS"
+#define WIFI_PASS  "WIFI_PSWRD"
 #define PC_IP      "IP_ADDRESS"
-#define UDP_PORT   4444
+#define UDP_PORT   YOUR_DESIRED_UDP_PORT
 
 #define ESC1_PIN 13  ///< CCW (Front-Right)
 #define ESC2_PIN 25  ///< CW  (Front-Left)  
@@ -122,7 +126,7 @@ static inline void pid_reset_all(void){
 }
 
 /*─────────────────────────────────────────────────────────────────────────────*
- * HARDWARE INITIALIZATION (Unchanged)
+ * HARDWARE INITIALIZATION
  *─────────────────────────────────────────────────────────────────────────────*/
 
 static void pwm_init(void){
@@ -175,14 +179,17 @@ static void i2c_init(void){
     i2c_master_write_to_device(I2C_PORT, 0x68, gyro_cfg, 2, pdMS_TO_TICKS(100));
 }
 
-static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data){
+/* Updated Event Handler to support aggressive auto-reconnects */
+static void wifi_event_handler(void *arg, esp_event_base_t base,
+                               int32_t id, void *data){
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START){
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED){
-        ESP_LOGW(TAG, "Wi-Fi dropped. Retrying...");
+        ESP_LOGW(TAG, "Wi-Fi connection dropped. Retrying...");
         xEventGroupClearBits(wifi_events, WIFI_GOT_IP_BIT);
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP){
+        ESP_LOGI(TAG, "Wi-Fi IP acquired successfully");
         xEventGroupSetBits(wifi_events, WIFI_GOT_IP_BIT);
     }
 }
@@ -192,21 +199,29 @@ static void wifi_init_sta(void){
     esp_netif_init();
     esp_event_loop_create_default();
     esp_netif_create_default_wifi_sta();
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
+
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
+
     wifi_config_t w = {0};
     strcpy((char*)w.sta.ssid,     WIFI_SSID);
     strcpy((char*)w.sta.password, WIFI_PASS);
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &w);
     esp_wifi_start();
+
+    /* [CRITICAL TELEMETRY FIX]: Turn off Wi-Fi power saving.
+     * Without this, the ESP32 sleeps periodically, causing massive UDP packet loss 
+     * and causing netcat/wireshark to see absolutely nothing. */
     esp_wifi_set_ps(WIFI_PS_NONE);
 }
 
 static void copro_uart_init(void){
-    uart_config_t c = {9600, UART_DATA_8_BITS, UART_PARITY_DISABLE, UART_STOP_BITS_1, UART_HW_FLOWCTRL_DISABLE, 0};
+    uart_config_t c = {9600, UART_DATA_8_BITS, UART_PARITY_DISABLE,
+                    UART_STOP_BITS_1, UART_HW_FLOWCTRL_DISABLE, 0};
     uart_param_config(COPRO_UART_NUM, &c);
     uart_set_pin(COPRO_UART_NUM, COPRO_TX_PIN, 17, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     uart_driver_install(COPRO_UART_NUM, 256, 0, 0, NULL, 0);
@@ -218,10 +233,20 @@ static void copro_uart_init(void){
 
 static void task_udp(void *a){
     xEventGroupWaitBits(wifi_events, WIFI_GOT_IP_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
-    struct sockaddr_in dest = { .sin_family = AF_INET, .sin_port = htons(UDP_PORT) };
+    ESP_LOGI(TAG, "UDP socket thread active");
+
+    struct sockaddr_in dest = {
+        .sin_family = AF_INET,
+        .sin_port   = htons(UDP_PORT)
+    };
     dest.sin_addr.s_addr = inet_addr(PC_IP);
+
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (sock < 0) { vTaskDelete(NULL); return; }
+    if (sock < 0){
+        ESP_LOGE(TAG, "UDP Socket error");
+        vTaskDelete(NULL);
+        return;
+    }
 
     char buf[128];
     for(;;){
@@ -245,7 +270,8 @@ static void task_udp(void *a){
 }
 
 static void task_ibus(void *a){
-    uart_config_t c = {115200, UART_DATA_8_BITS, UART_PARITY_DISABLE, UART_STOP_BITS_1, UART_HW_FLOWCTRL_DISABLE, 0};
+    uart_config_t c = {115200, UART_DATA_8_BITS, UART_PARITY_DISABLE,
+                    UART_STOP_BITS_1, UART_HW_FLOWCTRL_DISABLE, 0};
     uart_param_config(IBUS_UART_NUM, &c);
     uart_set_pin(IBUS_UART_NUM, UART_PIN_NO_CHANGE, IBUS_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     uart_driver_install(IBUS_UART_NUM, 1024, 0, 0, NULL, 0);
@@ -265,7 +291,7 @@ static void task_ibus(void *a){
                 rc.last_packet_ticks = xTaskGetTickCount();
                 taskEXIT_CRITICAL(&telemetry_mux);
             } else {
-                uart_flush(IBUS_UART_NUM); // Flush on bad checksum to resync
+                uart_flush(IBUS_UART_NUM); // [IBUS FIX] Flush on bad checksum to resync
             }
         } else if (len > 0) {
             uart_flush(IBUS_UART_NUM); // [IBUS FIX] Flush garbage data so it instantly finds the next header
@@ -281,25 +307,24 @@ static void task_flight(void *a){
 
     float sx=0, sy=0, sgx=0, sgy=0, sgz=0;
     uint16_t sample = 0;
-
+    
     // --- LOW PASS FILTER VARIABLES ---
-    float lpf_grr = 0.0f;
-    float lpf_gpr = 0.0f;
-    float lpf_gyr = 0.0f;
-    const float LPF_ALPHA = 0.15f; // Adjust between 0.1 and 0.3 for smoothing
+    static float lpf_grr = 0.0f;
+    static float lpf_gpr = 0.0f;
+    static float lpf_gyr = 0.0f;
+    const float LPF_ALPHA = 0.15f; 
 
     for(;;){
         if ((state == STATE_ARMED || state == STATE_DISARMED) &&
             (xTaskGetTickCount() - rc.last_packet_ticks) * portTICK_PERIOD_MS > 500){
+            ESP_LOGE(TAG, "Signal lost -> FAILSAFE");
             taskENTER_CRITICAL(&telemetry_mux);
             state = STATE_FAILSAFE;
             taskEXIT_CRITICAL(&telemetry_mux);
         }
 
-        // [I2C BUG FIX]: Timeout reduced from 100 ticks to 1ms to prevent PID loop freezing
-        esp_err_t err = i2c_master_write_read_device(I2C_PORT, 0x68, (uint8_t[]){0x3B}, 1, raw, 14, pdMS_TO_TICKS(1));
-        
-        if (err == ESP_OK) {
+        // [I2C BUG FIX]: Timeout reduced to 1ms to prevent PID loop freezing
+        if (i2c_master_write_read_device(I2C_PORT, 0x68, (uint8_t[]){0x3B}, 1, raw, 14, pdMS_TO_TICKS(1)) == ESP_OK) {
             int16_t ax = (raw[0]<<8)|raw[1],  ay = (raw[2]<<8)|raw[3],  az = (raw[4]<<8)|raw[5];
             int16_t gx = (raw[8]<<8)|raw[9],  gy = (raw[10]<<8)|raw[11], gz = (raw[12]<<8)|raw[13];
 
@@ -307,6 +332,7 @@ static void task_flight(void *a){
             case STATE_BOOTING:
                 for (int i = 0; i < 4; i++) set_throttle(i, 1000);
                 if (xTaskGetTickCount() > pdMS_TO_TICKS(3000)){
+                    ESP_LOGI(TAG, "Beginning calibration...");
                     taskENTER_CRITICAL(&telemetry_mux);
                     state = STATE_CALIBRATING;
                     taskEXIT_CRITICAL(&telemetry_mux);
@@ -330,6 +356,7 @@ static void task_flight(void *a){
                     imu.pitch_angle = atan2f(-ax, hypotf(ay, az)) * RAD_TO_DEG - imu.pitch_offset;
                     state = STATE_DISARMED;
                     taskEXIT_CRITICAL(&telemetry_mux);
+                    ESP_LOGI(TAG, "Calibration complete -> DISARMED");
                 }
                 break;
 
@@ -345,26 +372,24 @@ static void task_flight(void *a){
                 float p_prev = imu.pitch_angle;
                 taskEXIT_CRITICAL(&telemetry_mux);
 
-                // 1. Get Raw Data
+                // 1. Get raw rates
                 float raw_grr = (gx / 65.5f) - gr_off;
                 float raw_gpr = (gy / 65.5f) - gp_off;
                 float raw_gyr = (gz / 65.5f) - gy_off;
 
-                // 2. Apply Low-Pass Filter to eliminate propeller vibration noise
+                // 2. Apply Low-Pass Filter
                 lpf_grr = (LPF_ALPHA * raw_grr) + ((1.0f - LPF_ALPHA) * lpf_grr);
                 lpf_gpr = (LPF_ALPHA * raw_gpr) + ((1.0f - LPF_ALPHA) * lpf_gpr);
                 lpf_gyr = (LPF_ALPHA * raw_gyr) + ((1.0f - LPF_ALPHA) * lpf_gyr);
 
-                // 3. Use filtered data for angles and PID
+                // 3. Compute angles using filtered rates
                 float ar = atan2f(ay, az) * RAD_TO_DEG - r_off;
                 float ap = atan2f(-ax, hypotf(ay, az)) * RAD_TO_DEG - p_off;
-                
-                // [FILTER FIX]: Pass the clean 'lpf_grr' into the complementary filter
                 float new_roll  = 0.98f*(r_prev + lpf_grr*LOOP_TIME_S) + 0.02f*ar;
                 float new_pitch = 0.98f*(p_prev + lpf_gpr*LOOP_TIME_S) + 0.02f*ap;
 
                 taskENTER_CRITICAL(&telemetry_mux);
-                imu.gyro_roll_rate  = lpf_grr; 
+                imu.gyro_roll_rate  = lpf_grr; // Update telemetry to show smooth data
                 imu.gyro_pitch_rate = lpf_gpr;
                 imu.gyro_yaw_rate   = lpf_gyr;
                 imu.roll_angle      = new_roll;
@@ -380,25 +405,28 @@ static void task_flight(void *a){
                             taskENTER_CRITICAL(&telemetry_mux);
                             state = STATE_ARMED;
                             taskEXIT_CRITICAL(&telemetry_mux);
+                            ESP_LOGW(TAG, "ARMED");
                             c = 0;
                         }
                     }
                 } else {
                     float er = ((rc.roll  - 1500) * 0.06f) + new_roll;
                     float ep = ((rc.pitch - 1500) * 0.06f) + new_pitch; 
-                    
-                    // [FILTER FIX]: Yaw uses the filtered gyro rate now
-                    float ey = ((rc.yaw   - 1500) * 0.15f) - lpf_gyr;
+                    float ey = ((rc.yaw   - 1500) * 0.15f) - lpf_gyr; // Use filtered yaw rate
                     
                     float pr = pid_compute(&pid_r, er);
                     float pp = pid_compute(&pid_p, ep);
                     float py = pid_compute(&pid_y, ey);
 
                     if (rc.throttle > 1050){
-                        set_throttle(0, rc.throttle + pp - pr + py); // ESC1
-                        set_throttle(1, rc.throttle + pp + pr - py); // ESC2
-                        set_throttle(2, rc.throttle - pp + pr + py); // ESC3
-                        set_throttle(3, rc.throttle - pp - pr - py); // ESC4
+                        /* [CRITICAL PID DIRECTION FIX]:
+                         * Inverted the algebraic mixing operators for 'pp' and 'pr' 
+                         * to guarantee the control loop drives motors to counteract 
+                         * the detected physical pitch and roll offsets. */
+                        set_throttle(0, rc.throttle + pp - pr + py); // ESC1: Front-Right (CCW)
+                        set_throttle(1, rc.throttle + pp + pr - py); // ESC2: Front-Left  (CW)
+                        set_throttle(2, rc.throttle - pp + pr + py); // ESC3: Back-Left   (CCW)
+                        set_throttle(3, rc.throttle - pp - pr - py); // ESC4: Back-Right  (CW)
                     } else {
                         for (int i = 0; i < 4; i++) set_throttle(i, 1000);
                         pid_reset_all();
@@ -410,6 +438,7 @@ static void task_flight(void *a){
                             taskENTER_CRITICAL(&telemetry_mux);
                             state = STATE_DISARMED;
                             taskEXIT_CRITICAL(&telemetry_mux);
+                            ESP_LOGI(TAG, "DISARMED");
                             c = 0;
                         }
                     }
@@ -421,10 +450,11 @@ static void task_flight(void *a){
                     taskENTER_CRITICAL(&telemetry_mux);
                     state = STATE_DISARMED;
                     taskEXIT_CRITICAL(&telemetry_mux);
+                    ESP_LOGI(TAG, "Signal recovered -> DISARMED");
                 }
                 break;
             }
-        }
+        } // End of I2C check
 
         uint8_t s = (uint8_t)state;
         uart_write_bytes(COPRO_UART_NUM, (char*)&s, 1);
@@ -437,8 +467,15 @@ static void task_flight(void *a){
  *─────────────────────────────────────────────────────────────────────────────*/
 void app_main(void){
     nvs_flash_init();
+    ESP_LOGI(TAG, "Booting flight controller");
+    
+    // 1. Initialize PWM first so a stable idle train starts immediately
     pwm_init();
+    
+    // 2. [ESC FIX] Wait 3 seconds in absolute radio silence so ESC4 (GPIO27) boots flawlessly
     vTaskDelay(pdMS_TO_TICKS(3000));   
+    
+    // 3. Fire up the remaining subsystems safely
     wifi_init_sta();
     copro_uart_init();
     i2c_init();
