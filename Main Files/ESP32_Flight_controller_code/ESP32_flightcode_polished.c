@@ -45,9 +45,9 @@
  * CONFIGURATION
  *─────────────────────────────────────────────────────────────────────────────*/
 
-#define WIFI_SSID  "3rdF"
-#define WIFI_PASS  "HabilisEE-3rd"
-#define PC_IP      "192.168.68.104"
+#define WIFI_SSID  "WIFI_NAME"
+#define WIFI_PASS  "WIFI_PASSWORD"
+#define PC_IP      "IP_ADDRESS"
 #define UDP_PORT   4444
 
 #define ESC1_PIN 13  ///< CCW (Front-Right)
