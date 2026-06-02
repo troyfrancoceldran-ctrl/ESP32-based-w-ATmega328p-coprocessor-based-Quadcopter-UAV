@@ -59,9 +59,9 @@
  * CONFIGURATION
  *─────────────────────────────────────────────────────────────────────────────*/
 
-#define WIFI_SSID  "3rdF"
-#define WIFI_PASS  "HabilisEE-3rd"
-#define PC_IP      "192.168.68.104"
+#define WIFI_SSID  "WIFI_SSID"
+#define WIFI_PASS  "WIFI_PASSWORD"
+#define PC_IP      "YOUR_PC_IP_ADDRESS"
 #define UDP_PORT       4444   ///< Telemetry out (read-only stream)
 #define UDP_TUNE_PORT  4445   ///< PID tuning channel (bidirectional)
 
