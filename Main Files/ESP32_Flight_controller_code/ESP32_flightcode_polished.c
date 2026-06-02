@@ -7,29 +7,29 @@
  * the ESP32 applies them immediately without reflashing.
  *
  * COMMAND FORMAT (ASCII, sent to ESP32 port 4445):
- *   SET <axis> <term> <value>
+ * SET <axis> <term> <value>
  *
- *   axis : R (roll) | P (pitch) | Y (yaw)
- *   term : P | I | D
- *   value: float
+ * axis : R (roll) | P (pitch) | Y (yaw)
+ * term : P | I | D
+ * value: float
  *
  * EXAMPLES:
- *   SET R P 1.2        -> set roll Kp to 1.2
- *   SET P D 0.025      -> set pitch Kd to 0.025
- *   SET Y P 2.5        -> set yaw Kp to 2.5
- *   GET                -> ESP32 replies with all current gains
- *   SAVE               -> writes current gains to NVS (survives reboot)
- *   LOAD               -> reloads gains from NVS
- *   RESET              -> restores compiled-in default gains
+ * SET R P 1.2        -> set roll Kp to 1.2
+ * SET P D 0.025      -> set pitch Kd to 0.025
+ * SET Y P 2.5        -> set yaw Kp to 2.5
+ * GET                -> ESP32 replies with all current gains
+ * SAVE               -> writes current gains to NVS (survives reboot)
+ * LOAD               -> reloads gains from NVS
+ * RESET              -> restores compiled-in default gains
  *
  * TUNING LAPTOP (macOS/Linux terminal):
- *   # Send a command:
- *   echo "SET R P 1.2" | nc -u -w1 192.168.68.104 4445
+ * # Send a command:
+ * echo "SET R P 1.2" | nc -u -w1 192.168.68.104 4445
  *
- *   # Read telemetry:
- *   nc -u -l 4444
+ * # Read telemetry:
+ * nc -u -l 4444
  *
- *   # Or use the companion Python tuner script (pid_tuner.py)
+ * # Or use the companion Python tuner script (pid_tuner.py)
  *
  * All other firmware behaviour is identical to main.c.
  *
@@ -59,9 +59,9 @@
  * CONFIGURATION
  *─────────────────────────────────────────────────────────────────────────────*/
 
-#define WIFI_SSID  "WIFI_SSID"
-#define WIFI_PASS  "WIFI_PASSWORD"
-#define PC_IP      "YOUR_PC_IP_ADDRESS"
+#define WIFI_SSID  "3rdF"
+#define WIFI_PASS  "HabilisEE-3rd"
+#define PC_IP      "192.168.68.100"
 #define UDP_PORT       4444   ///< Telemetry out (read-only stream)
 #define UDP_TUNE_PORT  4445   ///< PID tuning channel (bidirectional)
 
@@ -86,16 +86,16 @@
 
 #define WIFI_GOT_IP_BIT BIT0
 
-/* Default gains — restored by RESET command */
-#define DEFAULT_ROLL_KP  1.5f
+/* Default gains — restored by RESET command(Starting PID Values to be adjusted during live tuning) */
+#define DEFAULT_ROLL_KP  0.8f
 #define DEFAULT_ROLL_KI  0.0f
-#define DEFAULT_ROLL_KD  0.02f
-#define DEFAULT_PITCH_KP 1.5f
+#define DEFAULT_ROLL_KD  0.015f
+#define DEFAULT_PITCH_KP 0.8f
 #define DEFAULT_PITCH_KI 0.0f
-#define DEFAULT_PITCH_KD 0.02f
-#define DEFAULT_YAW_KP   2.0f
+#define DEFAULT_PITCH_KD 0.015f
+#define DEFAULT_YAW_KP   1.5f
 #define DEFAULT_YAW_KI   0.0f
-#define DEFAULT_YAW_KD   0.03f
+#define DEFAULT_YAW_KD   0.025f
 
 static const char *TAG      = "FlightCtrl";
 static const char *NVS_NS   = "pid_gains";  ///< NVS namespace for saved gains
@@ -318,8 +318,8 @@ static void copro_uart_init(void) {
 
 /**
  * @brief Telemetry output — 10 Hz on UDP port 4444.
- * Format: timestamp_ms, state, roll_deg, pitch_deg, throttle_us,
- *         Rkp, Rki, Rkd, Pkp, Pki, Pkd, Ykp, Yki, Ykd
+ * Format: timestamp_ms, state, roll_deg, pitch_deg, yaw_rate, throttle_us,
+ * Rkp, Rki, Rkd, Pkp, Pki, Pkd, Ykp, Yki, Ykd
  * The gain fields let you confirm on the laptop that a SET command landed.
  */
 static void task_udp(void *a) {
@@ -336,13 +336,15 @@ static void task_udp(void *a) {
 
     char buf[256];
     for (;;) {
-        float roll_snap, pitch_snap;
+        // [MODIFIED] Added yaw_snap
+        float roll_snap, pitch_snap, yaw_snap;
         int   state_snap, throttle_snap;
         float rkp, rki, rkd, pkp, pki, pkd, ykp, yki, ykd;
 
         taskENTER_CRITICAL(&telemetry_mux);
         roll_snap     = imu.roll_angle;
         pitch_snap    = imu.pitch_angle;
+        yaw_snap      = imu.gyro_yaw_rate;  // <- Grab yaw rate from IMU struct
         state_snap    = (int)state;
         throttle_snap = rc.throttle;
         taskEXIT_CRITICAL(&telemetry_mux);
@@ -353,10 +355,11 @@ static void task_udp(void *a) {
         ykp = pid_y.Kp; yki = pid_y.Ki; ykd = pid_y.Kd;
         taskEXIT_CRITICAL(&pid_mux);
 
+        // [MODIFIED] Added %.2f to string format for yaw_snap, mapped before throttle_snap
         snprintf(buf, sizeof buf,
-                "%lu,%d,%.2f,%.2f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                "%lu,%d,%.2f,%.2f,%.2f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                  (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS),
-                state_snap, roll_snap, pitch_snap, throttle_snap,
+                state_snap, roll_snap, pitch_snap, yaw_snap, throttle_snap,
                 rkp, rki, rkd, pkp, pki, pkd, ykp, yki, ykd);
 
         sendto(sock, buf, strlen(buf), 0,
