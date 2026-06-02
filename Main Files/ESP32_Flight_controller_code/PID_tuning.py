@@ -17,7 +17,7 @@ from matplotlib.widgets import TextBox
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION 
 # ─────────────────────────────────────────────────────────────────────────────
-TARGET_ESP32_IP = "192.168.68.100"      
+TARGET_ESP32_IP = "IP-address"      
 PORT_TELEMETRY  = 4444               
 PORT_TUNING     = 4445               
 MAX_POINTS      = 200                
