@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- * @file    coprocessor.c
+ * @file    ATmega328p_coprocessor_code_polished.c
  * @brief   Bare-metal ATmega328P peripheral supervisor for ESP32 Flight Controller.
  * @author  Troy Franco G. Celdran, and Gemini+Claude(AI Assistants)
  * @date    2026-05-25
