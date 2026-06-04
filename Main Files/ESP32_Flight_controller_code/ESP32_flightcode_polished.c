@@ -1,40 +1,29 @@
 /**
- * @file main_pid_tuner.c
- * @brief Flight Controller with Live UDP PID Tuning.
- *
- * Adds a bidirectional UDP tuning channel on port 4445 (separate from
- * telemetry on 4444). Send gain commands from a laptop in real time;
- * the ESP32 applies them immediately without reflashing.
+ * ============================================================================
+ * @file    ESP32_flightcode_polished.c
+ * @brief   ESP32 Quadcopter Flight Controller with Live UDP PID Tuning.
+ * @author  Troy Franco G. Celdran, and Gemini+Claude(AI Assistants)
+ * @date    2026-05-25
+ * * @details 
+ * This firmware operates a multi-threaded flight controller on the ESP32. 
+ * It reads an MPU6050 IMU via I2C, decodes FlySky i-BUS RC inputs, computes 
+ * flight dynamics using a complementary filter, and drives 4 ESCs via PWM.
+ * * In addition to core flight tasks, it establishes two UDP sockets over Wi-Fi:
+ * 1. Telemetry Out (Port 4444): Streams live flight data to a ground station.
+ * 2. Tuning In/Out (Port 4445): Receives ASCII commands to adjust PID gains
+ * in real-time without reflashing, and can save them to NVS flash.
  *
  * COMMAND FORMAT (ASCII, sent to ESP32 port 4445):
- * SET <axis> <term> <value>
+ * SET <axis> <term> <value>  -> e.g., "SET R P 1.2" (Roll Kp = 1.2)
+ * GET                        -> Returns all current gains
+ * SAVE                       -> Writes current gains to non-volatile storage
+ * LOAD                       -> Reloads gains from storage
+ * RESET                      -> Restores compiled-in default gains
  *
- * axis : R (roll) | P (pitch) | Y (yaw)
- * term : P | I | D
- * value: float
- *
- * EXAMPLES:
- * SET R P 1.2        -> set roll Kp to 1.2
- * SET P D 0.025      -> set pitch Kd to 0.025
- * SET Y P 2.5        -> set yaw Kp to 2.5
- * GET                -> ESP32 replies with all current gains
- * SAVE               -> writes current gains to NVS (survives reboot)
- * LOAD               -> reloads gains from NVS
- * RESET              -> restores compiled-in default gains
- *
- * TUNING LAPTOP (macOS/Linux terminal):
- * # Send a command:
- * echo "SET R P 1.2" | nc -u -w1 192.168.68.104 4445
- *
- * # Read telemetry:
- * nc -u -l 4444
- *
- * # Or use the companion Python tuner script (pid_tuner.py)
- *
- * All other firmware behaviour is identical to main.c.
- *
- * @author Troy Franco G. Celdran
- * @date   2026-05-25
+ * TASK ARCHITECTURE:
+ * Core 0: task_udp (Priority 2), task_pid_tuner (Priority 1) -> Network handling
+ * Core 1: task_flight (Priority 10), task_ibus (Priority 5)  -> Hard real-time control
+ * ============================================================================
  */
 
 #include <stdio.h>
@@ -56,37 +45,41 @@
 #include "lwip/sockets.h"
 
 /*─────────────────────────────────────────────────────────────────────────────*
- * CONFIGURATION
+ * CONFIGURATION & HARDWARE MAPPING
  *─────────────────────────────────────────────────────────────────────────────*/
 
 #define WIFI_SSID  "wifi-ssid"
 #define WIFI_PASS  "wifi-password"
 #define PC_IP      "IP-address"
-#define UDP_PORT       4444   ///< Telemetry out (read-only stream)
-#define UDP_TUNE_PORT  4445   ///< PID tuning channel (bidirectional)
+#define UDP_PORT       4444   ///< Telemetry stream output (10 Hz)
+#define UDP_TUNE_PORT  4445   ///< PID tuning channel (Async bidirectional)
 
+/* Motor ESC PWM Pins (Quad X configuration) */
 #define ESC1_PIN 13
 #define ESC2_PIN 25
 #define ESC3_PIN 26
 #define ESC4_PIN 27
 
+/* I2C Mapping for MPU6050 */
 #define I2C_SCL  22
 #define I2C_SDA  21
 #define I2C_PORT I2C_NUM_0
-#define I2C_HZ   400000
+#define I2C_HZ   400000       ///< Fast mode I2C (400 kHz)
 
-#define IBUS_RX_PIN   4
+/* UART Mapping */
+#define IBUS_RX_PIN   4       ///< Receiver serial input
 #define IBUS_UART_NUM UART_NUM_1
-#define COPRO_TX_PIN   16
+#define COPRO_TX_PIN   16     ///< Telemetry to secondary MCU/OSD
 #define COPRO_UART_NUM UART_NUM_2
 
-#define LOOP_TIME_S 0.004f
-#define RAD_TO_DEG  57.2958f
-#define I_MAX       50.0f
+/* Flight Dynamics Constants */
+#define LOOP_TIME_S 0.004f    ///< Core flight loop period (250 Hz)
+#define RAD_TO_DEG  57.2958f  ///< Conversion factor for trigonometry
+#define I_MAX       50.0f     ///< PID Integral windup limit
 
 #define WIFI_GOT_IP_BIT BIT0
 
-/* Default gains — restored by RESET command(Starting PID Values to be adjusted during live tuning) */
+/* Default gains — Restored by the RESET command */
 #define DEFAULT_ROLL_KP  0.8f
 #define DEFAULT_ROLL_KI  0.0f
 #define DEFAULT_ROLL_KD  0.015f
@@ -98,41 +91,46 @@
 #define DEFAULT_YAW_KD   0.025f
 
 static const char *TAG      = "FlightCtrl";
-static const char *NVS_NS   = "pid_gains";  ///< NVS namespace for saved gains
+static const char *NVS_NS   = "pid_gains";  ///< NVS namespace for persistent memory
 
 /*─────────────────────────────────────────────────────────────────────────────*
  * DATA STRUCTURES
  *─────────────────────────────────────────────────────────────────────────────*/
 
+/** @brief Decoded radio control signals (typically 1000-2000 microseconds) */
 typedef struct {
     uint16_t roll, pitch, throttle, yaw;
-    uint32_t last_packet_ticks;
+    uint32_t last_packet_ticks;             ///< Timestamp for failsafe detection
 } RC_Input_t;
 
+/** @brief Processed sensor data and offsets */
 typedef struct {
-    float roll_angle, pitch_angle;
-    float gyro_roll_rate, gyro_pitch_rate, gyro_yaw_rate;
-    float roll_offset, pitch_offset;
-    float gyro_roll_offset, gyro_pitch_offset, gyro_yaw_offset;
+    float roll_angle, pitch_angle;          ///< Filtered attitude in degrees
+    float gyro_roll_rate, gyro_pitch_rate, gyro_yaw_rate; ///< LPF gyro rates
+    float roll_offset, pitch_offset;        ///< Accelerometer trim offsets
+    float gyro_roll_offset, gyro_pitch_offset, gyro_yaw_offset; ///< Gyro zero-rate offsets
 } IMU_Data_t;
 
+/** @brief Standard PID controller state */
 typedef struct {
     float Kp, Ki, Kd;
-    float prev_err;
-    float integral;
+    float prev_err;                         ///< Used to calculate derivative
+    float integral;                         ///< Accumulated error over time
 } PID_t;
 
+/** @brief Finite State Machine for drone operation */
 typedef enum {
     STATE_BOOTING = 0,
     STATE_CALIBRATING,
     STATE_DISARMED,
     STATE_ARMED,
-    STATE_FAILSAFE
+    STATE_FAILSAFE                          ///< Triggered on RC signal loss
 } FlightState_t;
 
 /*─────────────────────────────────────────────────────────────────────────────*
- * GLOBALS
+ * GLOBALS & THREAD SYNCHRONIZATION
  *─────────────────────────────────────────────────────────────────────────────*/
+
 RC_Input_t    rc    = {1500, 1500, 1000, 1500, 0};
 IMU_Data_t    imu   = {0};
 PID_t pid_r = {DEFAULT_ROLL_KP,  DEFAULT_ROLL_KI,  DEFAULT_ROLL_KD,  0, 0};
@@ -140,6 +138,7 @@ PID_t pid_p = {DEFAULT_PITCH_KP, DEFAULT_PITCH_KI, DEFAULT_PITCH_KD, 0, 0};
 PID_t pid_y = {DEFAULT_YAW_KP,   DEFAULT_YAW_KI,   DEFAULT_YAW_KD,   0, 0};
 FlightState_t state = STATE_BOOTING;
 
+/* Mutexes ensure data isn't corrupted when accessed across Core 0 (Network) and Core 1 (Flight) */
 static portMUX_TYPE telemetry_mux = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE pid_mux       = portMUX_INITIALIZER_UNLOCKED;
 static EventGroupHandle_t wifi_events;
@@ -149,14 +148,14 @@ static EventGroupHandle_t wifi_events;
  *─────────────────────────────────────────────────────────────────────────────*/
 
 /**
- * @brief Saves all current PID gains to NVS flash.
- * Survives power cycles. Called when tuning task receives "SAVE" command.
+ * @brief Serializes and saves current PID gains to NVS flash.
+ * @note ESP-IDF NVS doesn't natively support floats, so we use memcpy to 
+ * reinterpret the float's binary representation as a uint32_t before saving.
  */
 static void nvs_save_gains(void) {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
 
-    /* Store each float as a uint32 by reinterpreting the bits */
     uint32_t tmp;
     #define STORE(key, val) memcpy(&tmp, &(val), 4); nvs_set_u32(h, key, tmp)
     taskENTER_CRITICAL(&pid_mux);
@@ -172,8 +171,7 @@ static void nvs_save_gains(void) {
 }
 
 /**
- * @brief Loads PID gains from NVS. Falls back to defaults if no saved gains.
- * Called on boot and when tuning task receives "LOAD" command.
+ * @brief Loads PID gains from NVS into the active structs.
  */
 static void nvs_load_gains(void) {
     nvs_handle_t h;
@@ -202,17 +200,29 @@ static void nvs_load_gains(void) {
  * PID COMPUTATION
  *─────────────────────────────────────────────────────────────────────────────*/
 
+/**
+ * @brief Computes the PID correction output for a given axis.
+ * @param p Pointer to the PID state structure.
+ * @param error The difference between the target setpoint and current measurement.
+ * @return float The corrective output to be applied to the motors.
+ */
 static float pid_compute(PID_t *p, float error) {
     float P = p->Kp * error;
+    
+    // Accumulate integral with anti-windup clamping to prevent runaway integration
     p->integral += error * LOOP_TIME_S;
     if (p->integral >  I_MAX) p->integral =  I_MAX;
     if (p->integral < -I_MAX) p->integral = -I_MAX;
     float I = p->Ki * p->integral;
+    
+    // Derivative term: measures the rate of change of the error
     float D = p->Kd * (error - p->prev_err) / LOOP_TIME_S;
     p->prev_err = error;
+    
     return P + I + D;
 }
 
+/** @brief Zeros out integral buildup. Required when disarming or changing Ki. */
 static inline void pid_reset_all(void) {
     pid_r.integral = pid_p.integral = pid_y.integral = 0;
 }
@@ -222,10 +232,11 @@ static inline void pid_reset_all(void) {
  *─────────────────────────────────────────────────────────────────────────────*/
 
 static void pwm_init(void) {
+    // Configure standard 50Hz PWM for ESCs
     ledc_timer_config_t t = {
         .speed_mode      = LEDC_LOW_SPEED_MODE,
         .timer_num       = LEDC_TIMER_0,
-        .duty_resolution = LEDC_TIMER_13_BIT,
+        .duty_resolution = LEDC_TIMER_13_BIT, // 8192 discrete steps
         .freq_hz         = 50,
         .clk_cfg         = LEDC_AUTO_CLK
     };
@@ -238,7 +249,7 @@ static void pwm_init(void) {
             .timer_sel  = LEDC_TIMER_0,
             .intr_type  = LEDC_INTR_DISABLE,
             .gpio_num   = pins[i],
-            .duty       = 409,
+            .duty       = 409, // ~1000us baseline pulse (motor off)
             .hpoint     = 0
         };
         ledc_channel_config(&c);
@@ -246,9 +257,13 @@ static void pwm_init(void) {
     }
 }
 
+/**
+ * @brief Maps a microsecond pulse width (1000-2000us) to a 13-bit PWM duty cycle.
+ */
 static void set_throttle(ledc_channel_t ch, int us) {
     if (us < 1000) us = 1000;
     if (us > 2000) us = 2000;
+    // 20000us is the period of 50Hz. Formula maps us to the 0-8192 resolution.
     uint32_t duty = ((uint32_t)us * 8192) / 20000;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, ch, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, ch);
@@ -265,6 +280,8 @@ static void i2c_init(void) {
     };
     i2c_param_config(I2C_PORT, &conf);
     i2c_driver_install(I2C_PORT, conf.mode, 0, 0, 0);
+    
+    // MPU6050 Initialization: Wake device and configure Gyro range (0x08 = ±500 deg/s)
     uint8_t wake[2]     = {0x6B, 0x00};
     uint8_t gyro_cfg[2] = {0x1B, 0x08};
     i2c_master_write_to_device(I2C_PORT, 0x68, wake,     2, pdMS_TO_TICKS(100));
@@ -300,7 +317,7 @@ static void wifi_init_sta(void) {
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &w);
     esp_wifi_start();
-    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_ps(WIFI_PS_NONE); // Disable power saving to ensure low-latency UDP
 }
 
 static void copro_uart_init(void) {
@@ -317,18 +334,14 @@ static void copro_uart_init(void) {
  *─────────────────────────────────────────────────────────────────────────────*/
 
 /**
- * @brief Telemetry output — 10 Hz on UDP port 4444.
- * Format: timestamp_ms, state, roll_deg, pitch_deg, yaw_rate, throttle_us,
- * Rkp, Rki, Rkd, Pkp, Pki, Pkd, Ykp, Yki, Ykd
- * The gain fields let you confirm on the laptop that a SET command landed.
+ * @brief Telemetry Broadcaster (10 Hz).
+ * @details Reads thread-safe snapshots of flight data and blasts them to the PC.
  */
 static void task_udp(void *a) {
-    xEventGroupWaitBits(wifi_events, WIFI_GOT_IP_BIT,
-                        pdFALSE, pdTRUE, portMAX_DELAY);
+    xEventGroupWaitBits(wifi_events, WIFI_GOT_IP_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
     ESP_LOGI(TAG, "UDP telemetry task active");
 
-    struct sockaddr_in dest = {.sin_family = AF_INET,
-                            .sin_port   = htons(UDP_PORT)};
+    struct sockaddr_in dest = {.sin_family = AF_INET, .sin_port = htons(UDP_PORT)};
     dest.sin_addr.s_addr = inet_addr(PC_IP);
 
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
@@ -336,15 +349,15 @@ static void task_udp(void *a) {
 
     char buf[256];
     for (;;) {
-        // [MODIFIED] Added yaw_snap
         float roll_snap, pitch_snap, yaw_snap;
         int   state_snap, throttle_snap;
         float rkp, rki, rkd, pkp, pki, pkd, ykp, yki, ykd;
 
+        // Snapshots lock the structs briefly to prevent reading half-updated variables
         taskENTER_CRITICAL(&telemetry_mux);
         roll_snap     = imu.roll_angle;
         pitch_snap    = imu.pitch_angle;
-        yaw_snap      = imu.gyro_yaw_rate;  // <- Grab yaw rate from IMU struct
+        yaw_snap      = imu.gyro_yaw_rate;
         state_snap    = (int)state;
         throttle_snap = rc.throttle;
         taskEXIT_CRITICAL(&telemetry_mux);
@@ -355,31 +368,24 @@ static void task_udp(void *a) {
         ykp = pid_y.Kp; yki = pid_y.Ki; ykd = pid_y.Kd;
         taskEXIT_CRITICAL(&pid_mux);
 
-        // [MODIFIED] Added %.2f to string format for yaw_snap, mapped before throttle_snap
         snprintf(buf, sizeof buf,
                 "%lu,%d,%.2f,%.2f,%.2f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                  (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS),
                 state_snap, roll_snap, pitch_snap, yaw_snap, throttle_snap,
                 rkp, rki, rkd, pkp, pki, pkd, ykp, yki, ykd);
 
-        sendto(sock, buf, strlen(buf), 0,
-            (struct sockaddr*)&dest, sizeof dest);
-        vTaskDelay(pdMS_TO_TICKS(100));
+        sendto(sock, buf, strlen(buf), 0, (struct sockaddr*)&dest, sizeof dest);
+        vTaskDelay(pdMS_TO_TICKS(100)); // Sleep for 100ms (10Hz loop)
     }
 }
 
 /**
- * @brief Live PID tuning receiver — listens on UDP port 4445.
- *
- * Parses ASCII commands and applies gain changes immediately.
- * Runs on Core 0 at low priority — never touches flight-critical data
- * except through pid_mux, and only when the drone is in a safe state.
- *
- * Replies to the sender's IP with an ACK or the current gain table.
+ * @brief Live PID Command Listener.
+ * @details Listens on UDP port 4445 for ASCII commands. Updates the PID structs
+ * safely. Runs on Core 0 to avoid preempting flight dynamics on Core 1.
  */
 static void task_pid_tuner(void *a) {
-    xEventGroupWaitBits(wifi_events, WIFI_GOT_IP_BIT,
-                        pdFALSE, pdTRUE, portMAX_DELAY);
+    xEventGroupWaitBits(wifi_events, WIFI_GOT_IP_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
     ESP_LOGI(TAG, "PID tuner listening on port %d", UDP_TUNE_PORT);
 
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
@@ -408,7 +414,7 @@ static void task_pid_tuner(void *a) {
         if (len <= 0) continue;
         buf[len] = '\0';
 
-        /* Strip trailing newline/CR if present */
+        /* Strip trailing newlines/CR to ensure strict strcmp matching */
         for (int i = len - 1; i >= 0 && (buf[i]=='\n'||buf[i]=='\r'); i--)
             buf[i] = '\0';
 
@@ -425,8 +431,7 @@ static void task_pid_tuner(void *a) {
                 pid_p.Kp, pid_p.Ki, pid_p.Kd,
                 pid_y.Kp, pid_y.Ki, pid_y.Kd);
             taskEXIT_CRITICAL(&pid_mux);
-            sendto(sock, reply, strlen(reply), 0,
-                (struct sockaddr*)&sender, sender_len);
+            sendto(sock, reply, strlen(reply), 0, (struct sockaddr*)&sender, sender_len);
             continue;
         }
 
@@ -434,8 +439,7 @@ static void task_pid_tuner(void *a) {
         if (strncmp(buf, "SAVE", 4) == 0) {
             nvs_save_gains();
             const char *ack = "ACK SAVE\n";
-            sendto(sock, ack, strlen(ack), 0,
-                (struct sockaddr*)&sender, sender_len);
+            sendto(sock, ack, strlen(ack), 0, (struct sockaddr*)&sender, sender_len);
             continue;
         }
 
@@ -444,25 +448,20 @@ static void task_pid_tuner(void *a) {
             nvs_load_gains();
             pid_reset_all();
             const char *ack = "ACK LOAD\n";
-            sendto(sock, ack, strlen(ack), 0,
-                (struct sockaddr*)&sender, sender_len);
+            sendto(sock, ack, strlen(ack), 0, (struct sockaddr*)&sender, sender_len);
             continue;
         }
 
         /* ── RESET: restore compiled-in defaults ────────────────────── */
         if (strncmp(buf, "RESET", 5) == 0) {
             taskENTER_CRITICAL(&pid_mux);
-            pid_r.Kp = DEFAULT_ROLL_KP;  pid_r.Ki = DEFAULT_ROLL_KI;
-            pid_r.Kd = DEFAULT_ROLL_KD;
-            pid_p.Kp = DEFAULT_PITCH_KP; pid_p.Ki = DEFAULT_PITCH_KI;
-            pid_p.Kd = DEFAULT_PITCH_KD;
-            pid_y.Kp = DEFAULT_YAW_KP;   pid_y.Ki = DEFAULT_YAW_KI;
-            pid_y.Kd = DEFAULT_YAW_KD;
+            pid_r.Kp = DEFAULT_ROLL_KP;  pid_r.Ki = DEFAULT_ROLL_KI; pid_r.Kd = DEFAULT_ROLL_KD;
+            pid_p.Kp = DEFAULT_PITCH_KP; pid_p.Ki = DEFAULT_PITCH_KI; pid_p.Kd = DEFAULT_PITCH_KD;
+            pid_y.Kp = DEFAULT_YAW_KP;   pid_y.Ki = DEFAULT_YAW_KI; pid_y.Kd = DEFAULT_YAW_KD;
             taskEXIT_CRITICAL(&pid_mux);
             pid_reset_all();
             const char *ack = "ACK RESET\n";
-            sendto(sock, ack, strlen(ack), 0,
-                (struct sockaddr*)&sender, sender_len);
+            sendto(sock, ack, strlen(ack), 0, (struct sockaddr*)&sender, sender_len);
             continue;
         }
 
@@ -473,12 +472,11 @@ static void task_pid_tuner(void *a) {
 
             if (sscanf(buf, "SET %3s %3s %f", axis, term, &value) != 3) {
                 const char *err = "ERR bad format. Use: SET R P 1.2\n";
-                sendto(sock, err, strlen(err), 0,
-                    (struct sockaddr*)&sender, sender_len);
+                sendto(sock, err, strlen(err), 0, (struct sockaddr*)&sender, sender_len);
                 continue;
             }
 
-            /* Sanity clamp — prevents dangerous values being set mid-flight */
+            /* Sanity clamp — prevents dangerously high values being set mid-flight */
             if (value < 0.0f)  value = 0.0f;
             if (value > 20.0f) value = 20.0f;
 
@@ -489,8 +487,7 @@ static void task_pid_tuner(void *a) {
 
             if (!target) {
                 const char *err = "ERR unknown axis. Use R, P, or Y\n";
-                sendto(sock, err, strlen(err), 0,
-                    (struct sockaddr*)&sender, sender_len);
+                sendto(sock, err, strlen(err), 0, (struct sockaddr*)&sender, sender_len);
                 continue;
             }
 
@@ -501,34 +498,31 @@ static void task_pid_tuner(void *a) {
             else {
                 taskEXIT_CRITICAL(&pid_mux);
                 const char *err = "ERR unknown term. Use P, I, or D\n";
-                sendto(sock, err, strlen(err), 0,
-                    (struct sockaddr*)&sender, sender_len);
+                sendto(sock, err, strlen(err), 0, (struct sockaddr*)&sender, sender_len);
                 continue;
             }
             taskEXIT_CRITICAL(&pid_mux);
 
-            /* Reset integrators so the new Ki takes effect cleanly */
+            /* Reset integrators so a newly adjusted Ki doesn't explode the output */
             if (term[0]=='I' || term[0]=='i') pid_reset_all();
 
-            snprintf(reply, sizeof reply,
-                    "ACK SET %s %s %.3f\n", axis, term, value);
-            sendto(sock, reply, strlen(reply), 0,
-                (struct sockaddr*)&sender, sender_len);
+            snprintf(reply, sizeof reply, "ACK SET %s %s %.3f\n", axis, term, value);
+            sendto(sock, reply, strlen(reply), 0, (struct sockaddr*)&sender, sender_len);
 
             ESP_LOGI(TAG, "Gain updated: %s.K%s = %.3f", axis, term, value);
             continue;
         }
 
-        /* Unknown command */
-        const char *help =
-            "CMDS: SET <R|P|Y> <P|I|D> <val>  GET  SAVE  LOAD  RESET\n";
-        sendto(sock, help, strlen(help), 0,
-            (struct sockaddr*)&sender, sender_len);
+        /* Unknown command fallback */
+        const char *help = "CMDS: SET <R|P|Y> <P|I|D> <val>  GET  SAVE  LOAD  RESET\n";
+        sendto(sock, help, strlen(help), 0, (struct sockaddr*)&sender, sender_len);
     }
 }
 
 /**
- * @brief i-BUS receiver — runs on Core 1.
+ * @brief Serial Receiver Task (FlySky i-BUS).
+ * @details Reads 115200 baud serial packets. Parses the 32-byte i-BUS frame,
+ * verifies the checksum, and extracts channel 1-4 data.
  */
 static void task_ibus(void *a) {
     uart_config_t c = {115200, UART_DATA_8_BITS, UART_PARITY_DISABLE,
@@ -541,16 +535,20 @@ static void task_ibus(void *a) {
     uint8_t pkt[32];
     for (;;) {
         int len = uart_read_bytes(IBUS_UART_NUM, pkt, 32, pdMS_TO_TICKS(20));
+        
+        // i-BUS header: 0x20 (length) and 0x40 (command)
         if (len == 32 && pkt[0] == 0x20 && pkt[1] == 0x40) {
             uint16_t chk = 0xFFFF;
             for (int i = 0; i < 30; i++) chk -= pkt[i];
+            
+            // Validate Checksum (Little-Endian)
             if (chk == (pkt[30] | (pkt[31] << 8))) {
                 taskENTER_CRITICAL(&telemetry_mux);
                 rc.roll              = pkt[2]  | (pkt[3]  << 8);
                 rc.pitch             = pkt[4]  | (pkt[5]  << 8);
                 rc.throttle          = pkt[6]  | (pkt[7]  << 8);
                 rc.yaw               = pkt[8]  | (pkt[9]  << 8);
-                rc.last_packet_ticks = xTaskGetTickCount();
+                rc.last_packet_ticks = xTaskGetTickCount(); // Pet the failsafe dog
                 taskEXIT_CRITICAL(&telemetry_mux);
             } else {
                 uart_flush(IBUS_UART_NUM);
@@ -563,21 +561,23 @@ static void task_ibus(void *a) {
 }
 
 /**
- * @brief Core flight loop @ 250 Hz — runs on Core 1.
+ * @brief Core Flight Controller Task (250 Hz).
+ * @details Strictly executes every 4ms. Reads IMU, applies complementary filtering,
+ * runs the PID loops, and calculates motor mixing matrix.
  */
 static void task_flight(void *a) {
     uint8_t raw[14];
     TickType_t last         = xTaskGetTickCount();
-    const TickType_t period = pdMS_TO_TICKS(4);
+    const TickType_t period = pdMS_TO_TICKS(4); // 250Hz
 
     float sx=0, sy=0, sgx=0, sgy=0, sgz=0;
     uint16_t sample = 0;
 
     static float lpf_grr = 0.0f, lpf_gpr = 0.0f, lpf_gyr = 0.0f;
-    const float  LPF_ALPHA = 0.35f;
+    const float  LPF_ALPHA = 0.35f; // Low Pass Filter smoothing factor
 
     for (;;) {
-        /* Failsafe monitor */
+        /* Failsafe monitor: if no RC packets in 500ms, force disarm/failsafe */
         if ((state == STATE_ARMED || state == STATE_DISARMED) &&
             (xTaskGetTickCount() - rc.last_packet_ticks) * portTICK_PERIOD_MS > 500) {
             taskENTER_CRITICAL(&telemetry_mux);
@@ -586,20 +586,22 @@ static void task_flight(void *a) {
             ESP_LOGE(TAG, "Signal lost -> FAILSAFE");
         }
 
+        /* Burst read 14 bytes from MPU6050: Accel(6), Temp(2), Gyro(6) */
         if (i2c_master_write_read_device(I2C_PORT, 0x68,
                 (uint8_t[]){0x3B}, 1, raw, 14, pdMS_TO_TICKS(2)) != ESP_OK) {
-            uart_write_bytes(COPRO_UART_NUM,
-                            (char*)&(uint8_t){(uint8_t)state}, 1);
+            // If I2C fails, broadcast error state to coprocessor and wait for next cycle
+            uart_write_bytes(COPRO_UART_NUM, (char*)&(uint8_t){(uint8_t)state}, 1);
             vTaskDelayUntil(&last, period);
             continue;
         }
 
+        // Reconstruct signed 16-bit values from I2C payload
         int16_t ax=(raw[0]<<8)|raw[1], ay=(raw[2]<<8)|raw[3], az=(raw[4]<<8)|raw[5];
         int16_t gx=(raw[8]<<8)|raw[9], gy=(raw[10]<<8)|raw[11], gz=(raw[12]<<8)|raw[13];
 
         switch (state) {
         case STATE_BOOTING:
-            for (int i=0;i<4;i++) set_throttle(i,1000);
+            for (int i=0;i<4;i++) set_throttle(i,1000); // Motors off
             if (xTaskGetTickCount() > pdMS_TO_TICKS(3000)) {
                 taskENTER_CRITICAL(&telemetry_mux);
                 state = STATE_CALIBRATING;
@@ -609,6 +611,7 @@ static void task_flight(void *a) {
             break;
 
         case STATE_CALIBRATING:
+            // Accumulate 500 samples to find static zero-bias offsets
             sx+=atan2f(ay,az)*RAD_TO_DEG; sy+=atan2f(-ax,hypotf(ay,az))*RAD_TO_DEG;
             sgx+=gx/65.5f; sgy+=gy/65.5f; sgz+=gz/65.5f;
             if (++sample >= 500) {
@@ -633,15 +636,20 @@ static void task_flight(void *a) {
             float r_prev=imu.roll_angle,  p_prev=imu.pitch_angle;
             taskEXIT_CRITICAL(&telemetry_mux);
 
+            // Convert raw gyro ADC to degrees/second (65.5 LSB/(deg/s) for ±500 deg/s range)
             float raw_grr=(gx/65.5f)-gr_off, raw_gpr=(gy/65.5f)-gp_off;
             float raw_gyr=(gz/65.5f)-gy_off;
 
+            // Apply Low Pass Filter to attenuate high-frequency motor vibration
             lpf_grr = LPF_ALPHA*raw_grr + (1.0f-LPF_ALPHA)*lpf_grr;
             lpf_gpr = LPF_ALPHA*raw_gpr + (1.0f-LPF_ALPHA)*lpf_gpr;
             lpf_gyr = LPF_ALPHA*raw_gyr + (1.0f-LPF_ALPHA)*lpf_gyr;
 
+            // Compute pure accelerometer angles
             float ar = atan2f(ay,az)*RAD_TO_DEG - r_off;
             float ap = atan2f(-ax,hypotf(ay,az))*RAD_TO_DEG - p_off;
+            
+            // Complementary Filter: 98% Gyro (fast, precise, but drifts) + 2% Accel (slow, noisy, no drift)
             float new_roll  = 0.98f*(r_prev + lpf_grr*LOOP_TIME_S) + 0.02f*ar;
             float new_pitch = 0.98f*(p_prev + lpf_gpr*LOOP_TIME_S) + 0.02f*ap;
 
@@ -651,11 +659,12 @@ static void task_flight(void *a) {
             imu.roll_angle=new_roll; imu.pitch_angle=new_pitch;
             taskEXIT_CRITICAL(&telemetry_mux);
 
+            /* Arming Sequence: Throttle Low + Yaw Right */
             if (state == STATE_DISARMED) {
                 for (int i=0;i<4;i++) set_throttle(i,1000);
                 if (rc.throttle<1050 && rc.yaw>1900) {
                     static uint16_t c=0;
-                    if (++c>=125) {
+                    if (++c>=125) { // Hold for 500ms (125 ticks @ 4ms)
                         pid_reset_all();
                         taskENTER_CRITICAL(&telemetry_mux);
                         state=STATE_ARMED;
@@ -664,18 +673,21 @@ static void task_flight(void *a) {
                     }
                 }
             } else {
-                /* Read gains atomically for this control cycle */
+                /* Read gains atomically to ensure a UDP tuning command doesn't 
+                   corrupt the math mid-calculation */
                 taskENTER_CRITICAL(&pid_mux);
                 float rkp=pid_r.Kp,rki=pid_r.Ki,rkd=pid_r.Kd;
                 float pkp=pid_p.Kp,pki=pid_p.Ki,pkd=pid_p.Kd;
                 float ykp=pid_y.Kp,yki=pid_y.Ki,ykd=pid_y.Kd;
                 taskEXIT_CRITICAL(&pid_mux);
 
-                /* Temporary local PID structs using snapshotted gains */
+                /* Local PID structs for this specific loop iteration */
                 PID_t lr={rkp,rki,rkd,pid_r.prev_err,pid_r.integral};
                 PID_t lp={pkp,pki,pkd,pid_p.prev_err,pid_p.integral};
                 PID_t ly={ykp,yki,ykd,pid_y.prev_err,pid_y.integral};
 
+                // Calculate Errors: (RC Target Setpoint) - (Current Measurement)
+                // Scaling factors map standard RC (1000-2000) to max angles/rates
                 float er = ((rc.roll -1500)*0.06f) - new_roll;
                 float ep = ((rc.pitch-1500)*0.06f) - new_pitch;
                 float ey = ((rc.yaw  -1500)*0.15f) - lpf_gyr;
@@ -684,24 +696,26 @@ static void task_flight(void *a) {
                 float pp=pid_compute(&lp,ep);
                 float py=pid_compute(&ly,ey);
 
-                /* Write back state (prev_err, integral) */
+                /* Write back state (prev_err, integral) to globals */
                 pid_r.prev_err=lr.prev_err; pid_r.integral=lr.integral;
                 pid_p.prev_err=lp.prev_err; pid_p.integral=lp.integral;
                 pid_y.prev_err=ly.prev_err; pid_y.integral=ly.integral;
 
+                // Motor Mixing (Quad X configuration)
                 if (rc.throttle > 1050) {
-                    set_throttle(0, rc.throttle - pp - pr + py);
-                    set_throttle(1, rc.throttle - pp + pr - py);
-                    set_throttle(2, rc.throttle + pp + pr + py);
-                    set_throttle(3, rc.throttle + pp - pr - py);
+                    set_throttle(0, rc.throttle - pp - pr + py); // Front Left
+                    set_throttle(1, rc.throttle - pp + pr - py); // Front Right
+                    set_throttle(2, rc.throttle + pp + pr + py); // Rear Right
+                    set_throttle(3, rc.throttle + pp - pr - py); // Rear Left
                 } else {
                     for (int i=0;i<4;i++) set_throttle(i,1000);
-                    pid_reset_all();
+                    pid_reset_all(); // Prevent I-term windup while idling on ground
                 }
 
+                /* Disarming Sequence: Throttle Low + Yaw Left */
                 if (rc.throttle<1050 && rc.yaw<1100) {
                     static uint16_t c=0;
-                    if (++c>=125) {
+                    if (++c>=125) { // Hold for 500ms
                         taskENTER_CRITICAL(&telemetry_mux);
                         state=STATE_DISARMED;
                         taskEXIT_CRITICAL(&telemetry_mux);
@@ -712,40 +726,52 @@ static void task_flight(void *a) {
         } break;
 
         case STATE_FAILSAFE:
-            for (int i=0;i<4;i++) set_throttle(i,1000);
+            for (int i=0;i<4;i++) set_throttle(i,1000); // Cut motors
+            // Check for signal recovery
             if ((xTaskGetTickCount()-rc.last_packet_ticks)*portTICK_PERIOD_MS<300) {
                 taskENTER_CRITICAL(&telemetry_mux);
-                state=STATE_DISARMED;
+                state=STATE_DISARMED; // Recover to disarmed (safe) state
                 taskEXIT_CRITICAL(&telemetry_mux);
                 ESP_LOGI(TAG,"Signal recovered -> DISARMED");
             }
             break;
         }
 
+        // Output current state to secondary MCU/OSD via UART
         uint8_t s=(uint8_t)state;
         uart_write_bytes(COPRO_UART_NUM,(char*)&s,1);
+        
+        // Block until exactly 4ms has passed since 'last' (yielding to other tasks)
         vTaskDelayUntil(&last, period);
     }
 }
 
 /*─────────────────────────────────────────────────────────────────────────────*
- * MAIN
+ * MAIN ENTRY POINT
  *─────────────────────────────────────────────────────────────────────────────*/
 void app_main(void) {
+    // 1. Initialize NVS (Non-Volatile Storage)
     nvs_flash_init();
     ESP_LOGI(TAG, "Booting flight controller (live PID tuning enabled)");
 
+    // 2. Setup Base Hardware
     pwm_init();
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    vTaskDelay(pdMS_TO_TICKS(3000)); // Delay to let ESCs initialize/beep
 
-    nvs_load_gains();   /* Load last saved gains before tasks start */
+    // 3. Load Saved Data
+    nvs_load_gains();
 
+    // 4. Initialize Peripherals
     wifi_init_sta();
     copro_uart_init();
     i2c_init();
 
-    xTaskCreatePinnedToCore(task_ibus,      "RX",     4096, NULL,  5, NULL, 1);
-    xTaskCreatePinnedToCore(task_flight,    "Flight", 6144, NULL, 10, NULL, 1);
+    // 5. Spin up FreeRTOS Tasks
+    // Network processes on Core 0 (slower, variable latency)
     xTaskCreatePinnedToCore(task_udp,       "UDP",    4096, NULL,  2, NULL, 0);
     xTaskCreatePinnedToCore(task_pid_tuner, "Tuner",  4096, NULL,  1, NULL, 0);
+
+    // Flight processes on Core 1 (high priority, hard real-time)
+    xTaskCreatePinnedToCore(task_ibus,      "RX",     4096, NULL,  5, NULL, 1);
+    xTaskCreatePinnedToCore(task_flight,    "Flight", 6144, NULL, 10, NULL, 1);
 }
