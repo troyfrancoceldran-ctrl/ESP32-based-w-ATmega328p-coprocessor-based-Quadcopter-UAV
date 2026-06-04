@@ -1,6 +1,6 @@
 """
 ===============================================================================
-File: pid_tuner.py — Live PID Tuner for ESP32 Quadcopter (Unified GUI Version)
+File: PID_tuning.py — Live PID Tuner for ESP32 Quadcopter (Unified GUI Version)
 Authors: Troy Celdran, and Gemini + Claude (AI Assistants)
 Date: June 4, 2026
 Description: 
